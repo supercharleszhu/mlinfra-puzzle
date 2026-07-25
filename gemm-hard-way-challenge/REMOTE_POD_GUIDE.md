@@ -36,7 +36,7 @@ Preferred executable helper:
 ```bash
 cd gemm-hard-way-challenge
 scripts/upload_to_pod.sh
-scripts/upload_to_pod.sh --with-cutlass   # needed for solution days 13-26
+scripts/upload_to_pod.sh --with-cutlass   # needed for solution days 13-19
 ```
 
 From the `cutlass-puzzle` repo root:
@@ -131,7 +131,7 @@ kubectl -n "$GEMM_NS" exec "$GEMM_POD" -- bash -lc "
 "
 ```
 
-CUTLASS solution files 13-26 require CUTLASS headers. If the pod has a full LeetCUDA checkout with `./cutlass`, run from that checkout or set `CUTLASS_DIR`, then add `--include-cutlass`. Days 15-26 additionally require Hopper/SM90+ and build with `sm_90a`.
+CUTLASS solution files 13-19 require CUTLASS headers. If the pod has a full LeetCUDA checkout with `./cutlass`, run from that checkout or set `CUTLASS_DIR`, then add `--include-cutlass`. Days 13-19 additionally require Hopper/SM90+ and build with `sm_90a`.
 
 ## 5. Exercise correctness run
 
@@ -245,7 +245,7 @@ Useful metrics to inspect after each day:
 | 4-7 | Reduced shared-memory pressure, register use, occupancy, and stall reasons. |
 | 8-12 | Tensor Core instruction presence, e.g. `HMMA`/`MMA`, plus pipeline stalls. |
 | 13-14 | CUTLASS tile shape, stages, swizzle/scheduler effects, and achieved TFLOPS. |
-| 15-26 | Hopper BF16 TMA/Stream-K/fast.cu-inspired schedule choices, handwritten matmul_2 TMA/WGMMA, TMA store/Hilbert scheduling, `sm_90a` compile behavior, and achieved TFLOPS on H100. |
+| 13-19 | Handwritten Hopper TMA/WGMMA and CUTLASS Hopper schedule choices, `sm_90a` compile behavior, and achieved TFLOPS on H100. |
 
 ## 8. Interactive debugging shell
 

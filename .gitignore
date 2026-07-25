@@ -28,3 +28,6 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 _executed.ipynb
+
+# Benchmark outputs
+gemm-hard-way-challenge/result/

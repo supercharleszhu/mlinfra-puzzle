@@ -69,8 +69,6 @@ def _make_registry(ext, dtype: torch.dtype, include_cutlass: bool):
             "06_vectorize": lambda a, b: _fp32_out(ext.sgemm_vectorize, a, b),
             "07_warptiling": lambda a, b: _same_dtype_out(ext.sgemm_warptiling_default, a, b),
         }
-        if include_cutlass:
-            registry["13_cutlass_fp32"] = lambda a, b: _fp32_out(ext.sgemm_cutlass_fp32, a, b)
         return registry
 
     if dtype == torch.float16:
@@ -82,11 +80,6 @@ def _make_registry(ext, dtype: torch.dtype, include_cutlass: bool):
             "11_tensorcore_db_fp16": lambda a, b: _fp32_then_cast(ext.sgemm_tensorcore_double_buffered_fp16, a, b),
             "12_tensorcore_async_fp16": lambda a, b: _fp32_then_cast(ext.sgemm_tensorcore_async_fp16, a, b),
         }
-        if include_cutlass:
-            registry["13_cutlass_fp16"] = lambda a, b: _fp32_then_cast(ext.sgemm_cutlass_fp16, a, b)
-            registry["14_cutlass_autotune_fp16_cfg0"] = lambda a, b: _fp32_then_cast_config(
-                ext.sgemm_cutlass_autotune_fp16, 0, a, b
-            )
         return registry
 
     registry = {
@@ -98,55 +91,26 @@ def _make_registry(ext, dtype: torch.dtype, include_cutlass: bool):
         "12_tensorcore_async_bf16": lambda a, b: _fp32_then_cast(ext.sgemm_tensorcore_async_bf16, a, b),
     }
     if include_cutlass:
-        registry["13_cutlass_bf16"] = lambda a, b: _fp32_then_cast(ext.sgemm_cutlass_bf16, a, b)
-        registry["14_cutlass_autotune_bf16_cfg0"] = lambda a, b: _fp32_then_cast_config(
-            ext.sgemm_cutlass_autotune_bf16, 0, a, b
-        )
-        if hasattr(ext, "sgemm_cutlass_hopper_bf16"):
-            registry["15_cutlass_hopper_bf16"] = lambda a, b: _bf16_out(ext.sgemm_cutlass_hopper_bf16, a, b)
-            registry["15_cutlass_hopper_bf16_tma_warp_specialized_auto"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_bf16_tma_warp_specialized_auto, a, b
+        if hasattr(ext, "sgemm_cutlass3_hopper_tunable_bf16"):
+            registry["19_cutlass3_hopper_tunable_bf16"] = lambda a, b: _bf16_out(
+                ext.sgemm_cutlass3_hopper_tunable_bf16, a, b
             )
-            registry["15_cutlass_hopper_bf16_tma_warp_specialized_constant"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_bf16_tma_warp_specialized_constant, a, b
-            )
-            registry["15_cutlass_hopper_bf16_tma_warp_specialized_streamk_auto"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_auto, a, b
-            )
-            registry["15_cutlass_hopper_bf16_tma_warp_specialized_streamk_constant"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_constant, a, b
-            )
-            registry["16_cutlass_hopper_autotune_bf16_cfg0"] = lambda a, b: _hopper_autotune_bf16_out(
-                ext.sgemm_cutlass_hopper_autotune_bf16, a, b
-            )
-            registry["17_hopper_fastcu_tma_wgmma_bf16"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_fastcu_tma_wgmma_bf16, a, b
-            )
-            registry["18_fastcu_matmul2_manual_tma_wgmma_bf16"] = lambda a, b: _fastcu_handwritten_bf16_out(
+            registry["13_fastcu_matmul2_manual_tma_wgmma_bf16"] = lambda a, b: _fastcu_handwritten_bf16_out(
                 ext.sgemm_fastcu_matmul2_manual_tma_wgmma_bf16, a, b
             )
-            registry["19_hopper_fastcu_big_tile_bf16"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_fastcu_big_tile_bf16, a, b
-            )
-            registry["20_hopper_fastcu_persistent_bf16"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_fastcu_persistent_bf16, a, b
-            )
-            registry["21_hopper_fastcu_cluster_bf16"] = lambda a, b: _bf16_out(
-                ext.sgemm_cutlass_hopper_fastcu_cluster_bf16, a, b
-            )
-            registry["22_fastcu_handwritten_tma_wgmma_bf16"] = lambda a, b: _fastcu_handwritten_bf16_out(
+            registry["14_fastcu_matmul3_big_tile_bf16"] = lambda a, b: _fastcu_handwritten_bf16_out(
                 ext.sgemm_fastcu_handwritten_tma_wgmma_bf16, a, b
             )
-            registry["23_fastcu_cached_tma_maps_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
+            registry["15_fastcu_matmul4_warp_specialized_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
                 ext.sgemm_fastcu_handwritten_cached_tma_maps_bf16, a, b
             )
-            registry["24_fastcu_final_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
+            registry["16_fastcu_matmul6_persistent_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
                 ext.sgemm_fastcu_final_bf16, a, b
             )
-            registry["25_fastcu_tma_store_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
+            registry["17_fastcu_matmul10_tma_store_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
                 ext.sgemm_fastcu_tma_store_bf16, a, b
             )
-            registry["26_fastcu_hilbert_final_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
+            registry["18_fastcu_matmul12_final_bf16"] = lambda a, b: _fastcu_cached_bf16_out(
                 ext.sgemm_fastcu_hilbert_final_bf16, a, b
             )
     return registry

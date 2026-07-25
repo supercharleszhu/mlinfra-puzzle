@@ -1,0 +1,507 @@
+// GEMM the Hard Way, Day 14.
+// Focus: fast.cu matmul_3 - larger handwritten WGMMA output tiles.
+//
+// This file follows examples/matmul/matmul_3.cuh directly. Unlike later
+// fast.cu kernels, it has no producer/consumer queue, no QSIZE, no persistent
+// tile loop, no TMA store, and no Hilbert scheduling. One CTA owns one larger
+// output tile, loads A/B^T with TMA, executes WGMMA over the larger tile, and
+// stores C^T directly.
+
+using std::max;
+typedef __nv_bfloat16 bf16;
+
+inline void day14_cuda_check(cudaError_t error, const char *file, int line) {
+    if (error != cudaSuccess) {
+        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
+        assert(false);
+    }
+}
+#define cudaCheck(err) (day14_cuda_check(err, __FILE__, __LINE__))
+
+
+namespace M3 {
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
+
+// Blank A - descriptor address encoding:
+// Keep the low 18 address bits with `x & 0x3FFFF`, then divide by the
+// descriptor's 16-byte address unit by shifting right four bits. Fill the
+// blank with the complete mask-and-shift expression, not a byte address.
+__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return GEMM_TODO_UINT("Day 14: encode the low 18 address bits in 16-byte units"); }
+
+__device__ uint64_t make_smem_desc(bf16* ptr) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    uint64_t desc = 0x0000000000000000;
+    desc |= matrix_descriptor_encode(addr);
+    desc |= matrix_descriptor_encode((uint64_t)16) << 16;
+    desc |= matrix_descriptor_encode((uint64_t)1024) << 32;
+    desc |= 1llu << 62; // 128B swizzle
+    return desc;
+    }
+
+
+__device__ void warpgroup_arrive() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+
+__device__ void warpgroup_commit_batch() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+
+template <int N>
+__device__ void warpgroup_wait() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+}
+
+template <int BlockMajorSize, int BlockMinorSize>
+void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, int blocks_width) {
+    void* gmem_address = (void*)gmem_ptr;
+    // Blanks B and C - global tensor extents:
+    // This rank-2 map is ordered [minor, major]. The minor dimension spans
+    // every K element: BlockMinorSize times blocks_width. The major dimension
+    // spans every matrix row: BlockMajorSize times blocks_height.
+    uint64_t gmem_prob_shape[5] = {GEMM_TODO_UINT("Day 14: global minor extent"), GEMM_TODO_UINT("Day 14: global major extent"), 1, 1, 1};
+    // Blank D - global major-dimension stride:
+    // Advancing one major row skips the full minor dimension. Fill this in
+    // with sizeof(bf16) times BlockMinorSize times blocks_width, in bytes.
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16), GEMM_TODO_UINT("Day 14: global major stride in bytes"), 0, 0, 0};
+    // Blanks E and F - one shared-memory TMA tile:
+    // The box uses the same [minor, major] order: BlockMinorSize elements
+    // along K and BlockMajorSize rows along M for A or N for B^T.
+    uint32_t smem_box_shape[5] = {GEMM_TODO_UINT("Day 14: shared tile minor extent"), GEMM_TODO_UINT("Day 14: shared tile major extent"), 1, 1, 1};
+    uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, gmem_address, gmem_prob_shape,
+        gmem_prob_stride + 1, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+}
+
+CUtensorMap *d_tma_map_A = 0;
+CUtensorMap *d_tma_map_B = 0;
+int _prev_m=0, _prev_n=0, _prev_k=0;
+
+template<int st_rows, int st_cols>
+__host__ static inline CUtensorMap* allocate_and_create_tensor_map(bf16* src, int blocks_height, int blocks_width) {
+    CUtensorMap *tma_map_d;
+    cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
+    CUtensorMap tma_map_host;
+    create_tensor_map<st_rows, st_cols>(&tma_map_host, src, blocks_height, blocks_width);
+    cudaMemcpy(tma_map_d, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    return tma_map_d;
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
+        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
+        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
+        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
+        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63,  "
+        " %64,  %65,  %66,  %67,  %68,  %69,  %70,  %71,  "
+        " %72,  %73,  %74,  %75,  %76,  %77,  %78,  %79,  "
+        " %80,  %81,  %82,  %83,  %84,  %85,  %86,  %87,  "
+        " %88,  %89,  %90,  %91,  %92,  %93,  %94,  %95,  "
+        " %96,  %97,  %98,  %99,  %100, %101, %102, %103,  "
+        " %104, %105, %106, %107, %108, %109, %110, %111,  "
+        " %112, %113, %114, %115, %116, %117, %118, %119,  "
+        " %120, %121, %122, %123, %124, %125, %126, %127},"
+        " %128,"
+        " %129,"
+        " %130,    %131,  %132,  %133,  %134;\n"
+        "}\n"
+        :   "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7]),
+            "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]),
+            "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]), "+f"(d[3][6]), "+f"(d[3][7]),
+            "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]),
+            "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
+            "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]), "+f"(d[6][6]), "+f"(d[6][7]),
+            "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]), "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7]),
+            "+f"(d[8][0]), "+f"(d[8][1]), "+f"(d[8][2]), "+f"(d[8][3]), "+f"(d[8][4]), "+f"(d[8][5]), "+f"(d[8][6]), "+f"(d[8][7]),
+            "+f"(d[9][0]), "+f"(d[9][1]), "+f"(d[9][2]), "+f"(d[9][3]), "+f"(d[9][4]), "+f"(d[9][5]), "+f"(d[9][6]), "+f"(d[9][7]),
+            "+f"(d[10][0]), "+f"(d[10][1]), "+f"(d[10][2]), "+f"(d[10][3]), "+f"(d[10][4]), "+f"(d[10][5]), "+f"(d[10][6]), "+f"(d[10][7]),
+            "+f"(d[11][0]), "+f"(d[11][1]), "+f"(d[11][2]), "+f"(d[11][3]), "+f"(d[11][4]), "+f"(d[11][5]), "+f"(d[11][6]), "+f"(d[11][7]),
+            "+f"(d[12][0]), "+f"(d[12][1]), "+f"(d[12][2]), "+f"(d[12][3]), "+f"(d[12][4]), "+f"(d[12][5]), "+f"(d[12][6]), "+f"(d[12][7]),
+            "+f"(d[13][0]), "+f"(d[13][1]), "+f"(d[13][2]), "+f"(d[13][3]), "+f"(d[13][4]), "+f"(d[13][5]), "+f"(d[13][6]), "+f"(d[13][7]),
+            "+f"(d[14][0]), "+f"(d[14][1]), "+f"(d[14][2]), "+f"(d[14][3]), "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
+            "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]), "+f"(d[15][4]), "+f"(d[15][5]), "+f"(d[15][6]), "+f"(d[15][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
+        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
+        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
+        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
+        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63},"
+        " %64,"
+        " %65,"
+        " %66,    %67,  %68,  %69,  %70;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
+            "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
+            "+f"(d[3][6]), "+f"(d[3][7]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
+            "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]), "+f"(d[5][0]), "+f"(d[5][1]),
+            "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
+            "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]),
+            "+f"(d[6][6]), "+f"(d[6][7]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
+            "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ __forceinline__ void wgmma192(float d[12][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n192k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
+        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
+        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
+        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
+        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63,  "
+        " %64,  %65,  %66,  %67,  %68,  %69,  %70,  %71,  "
+        " %72,  %73,  %74,  %75,  %76,  %77,  %78,  %79,  "
+        " %80,  %81,  %82,  %83,  %84,  %85,  %86,  %87,  "
+        " %88,  %89,  %90,  %91,  %92,  %93,  %94,  %95},  "
+        " %96,"
+        " %97,"
+        " %98,    %99,  %100,  %101,  %102;\n"
+        "}\n"
+        :   "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7]),
+            "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]),
+            "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]), "+f"(d[3][6]), "+f"(d[3][7]),
+            "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]),
+            "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
+            "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]), "+f"(d[6][6]), "+f"(d[6][7]),
+            "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]), "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7]),
+            "+f"(d[8][0]), "+f"(d[8][1]), "+f"(d[8][2]), "+f"(d[8][3]), "+f"(d[8][4]), "+f"(d[8][5]), "+f"(d[8][6]), "+f"(d[8][7]),
+            "+f"(d[9][0]), "+f"(d[9][1]), "+f"(d[9][2]), "+f"(d[9][3]), "+f"(d[9][4]), "+f"(d[9][5]), "+f"(d[9][6]), "+f"(d[9][7]),
+            "+f"(d[10][0]), "+f"(d[10][1]), "+f"(d[10][2]), "+f"(d[10][3]), "+f"(d[10][4]), "+f"(d[10][5]), "+f"(d[10][6]), "+f"(d[10][7]),
+            "+f"(d[11][0]), "+f"(d[11][1]), "+f"(d[11][2]), "+f"(d[11][3]), "+f"(d[11][4]), "+f"(d[11][5]), "+f"(d[11][6]), "+f"(d[11][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma64(float d[4][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31},"
+        " %32,"
+        " %33,"
+        " %34, %35, %36, %37, %38;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
+            "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
+            "+f"(d[3][6]), "+f"(d[3][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15},  "
+        " %16,"
+        " %17,"
+        " %18, %19, %20, %21, %22;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7},   "
+        " %8,"
+        " %9,"
+        " %10, %11, %12, %13, %14;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ inline void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
+    static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
+    if  constexpr (WGMMA_N == 256)
+        wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
+    if  constexpr (WGMMA_N == 192)
+        wgmma192<1, 1, 1, 0, 0>(d, sA, sB);
+    if  constexpr (WGMMA_N == 128)
+        wgmma128<1, 1, 1, 0, 0>(d, sA, sB);
+    if constexpr (WGMMA_N == 64)
+        wgmma64<1, 1, 1, 0, 0>(d, sA, sB);
+    if constexpr (WGMMA_N == 32)
+        wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
+}
+
+template <int BM, int BN, int BK>
+struct SMem {
+    alignas(128) bf16 A[BM*BK];
+    alignas(128) bf16 B[BK*BN];
+};
+
+template<int BM, int BN, int BK, int NUM_THREADS, bool DBG>
+__global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB, int *DB) {
+    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
+    constexpr int B_WG_M = BM / (NUM_THREADS / 128);
+    extern __shared__ SMem<BM, BN, BK> s;
+    bf16 *sA = s.A;
+    bf16 *sB = s.B;
+    // Barriers cannot be in the struct and have to be declared this way
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ barrier barA, barB;
+    float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
+    static_assert(sizeof(d) * NUM_THREADS == BM * BN * sizeof(float));
+    memset(d, 0, sizeof(d));
+
+    const int num_blocks_k = K / BK;
+    int num_block_n = blockIdx.x % (N / BN);
+    int num_block_m = blockIdx.x / (N / BN);
+
+    if (threadIdx.x == 0) {
+        init(&barA, blockDim.x);
+        init(&barB, blockDim.x);
+        cde::fence_proxy_async_shared_cta();
+    }
+    __syncthreads();
+    int wg_idx = threadIdx.x / 128;
+
+    barrier::arrival_token tokenA, tokenB;
+    int sumLoad = 0, cntLoad = 0;
+    int sumCompute = 0, cntCompute = 0;
+    int sumStore = 0, cntStore = 0;
+    for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter) {
+        clock_t start = clock();
+        // Load
+        if (threadIdx.x == 0) {
+            // Blanks G and H - A's rank-2 TMA coordinates:
+            // The minor/K coordinate advances by one BK tile per K-loop
+            // iteration. The major/M coordinate selects this CTA's BM tile.
+            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, GEMM_TODO_INT("Day 14: A K coordinate"), GEMM_TODO_INT("Day 14: A M coordinate"), barA);
+            // Blank I - A transaction size:
+            // The barrier must expect exactly the loaded BK-by-BM BF16 tile,
+            // expressed in bytes.
+            tokenA = cuda::device::barrier_arrive_tx(barA, 1, GEMM_TODO_UINT("Day 14: A TMA transaction bytes"));
+            // Blanks J and K - B^T's rank-2 TMA coordinates:
+            // B^T also advances by block_k_iter * BK in K, while its major
+            // coordinate selects the CTA's BN output-column tile.
+            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, GEMM_TODO_INT("Day 14: B K coordinate"), GEMM_TODO_INT("Day 14: B N coordinate"), barB);
+            // Blank L - B transaction size:
+            // The second barrier expects the complete BK-by-BN BF16 tile,
+            // again expressed in bytes.
+            tokenB = cuda::device::barrier_arrive_tx(barB, 1, GEMM_TODO_UINT("Day 14: B TMA transaction bytes"));
+        } else {
+            tokenA = barA.arrive();
+            tokenB = barB.arrive();
+        }
+        barA.wait(std::move(tokenA));
+        barB.wait(std::move(tokenB));
+        __syncthreads();
+        if constexpr (DBG) {
+            sumLoad += clock() - start;
+            cntLoad++;
+            start = clock();
+        }
+
+        // Compute
+        warpgroup_arrive();
+        #pragma unroll
+        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            // Blank M - A's warpgroup/M-subtile offset:
+            // Select the WGMMA_M-row slice owned by this warpgroup and m_it.
+            // Convert that row index to BF16 elements by multiplying by BK:
+            // BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M.
+            bf16 *wgmma_sA = sA + GEMM_TODO_INT("Day 14: A warpgroup M-subtile offset");
+            #pragma unroll
+            for (int k_it = 0; k_it < BK/WGMMA_K; ++k_it) {
+                // Blanks N and O - WGMMA K-slice offsets:
+                // Each m64nNk16 instruction consumes WGMMA_K=16 values from
+                // both operands. Offset A and B by k_it * WGMMA_K so the loop
+                // covers every K=16 slice of the BK tile exactly once.
+                wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[GEMM_TODO_INT("Day 14: A K-slice offset")], &sB[GEMM_TODO_INT("Day 14: B K-slice offset")]);
+            }
+        }
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+
+        if constexpr (DBG) {
+            sumCompute += clock() - start;
+            cntCompute++;
+        }
+    }
+
+    // Store
+    {
+        clock_t start = clock();
+
+        uint32_t tid = threadIdx.x % 128;
+        uint32_t lane = tid & 31;
+        uint32_t warp = tid / 32;
+        uint32_t row = warp*16 + lane / 4;
+
+        bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
+
+        #pragma unroll
+        for (uint32_t m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
+            #pragma unroll
+            for (uint32_t w = 0; w < WGMMA_N/16; ++w) {
+                int col = 16*w + 2*(tid % 4);
+                #define IDX(i, j) ((j)*M + ((i) + yo))
+
+                block_C[IDX(row, col)] = d[m_it][w][0];
+                block_C[IDX(row, col+1)] = d[m_it][w][1];
+                block_C[IDX(row+8, col)] = d[m_it][w][2];
+                block_C[IDX(row+8, col+1)] = d[m_it][w][3];
+                block_C[IDX(row, col+8)] = d[m_it][w][4];
+                block_C[IDX(row, col+9)] = d[m_it][w][5];
+                block_C[IDX(row+8, col+8)] = d[m_it][w][6];
+                block_C[IDX(row+8, col+9)] = d[m_it][w][7];
+
+                #undef IDX
+            }
+        }
+        if constexpr (DBG) {
+            sumStore += clock() - start;
+            cntStore++;
+            if (threadIdx.x == 63) {
+                int i = blockIdx.x*6;
+                DB[i] = sumLoad; DB[i + 1] = cntLoad;
+                DB[i + 2] = sumCompute; DB[i + 3] = cntCompute;
+                DB[i + 4] = sumStore; DB[i + 5] = cntStore;
+            }
+        }
+    }
+}
+
+
+void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int NUM_THREADS = 128;
+
+    if (!d_tma_map_A) {
+        d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
+        d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
+        _prev_m = M;
+        _prev_n = N;
+        _prev_k = K;
+    }
+    // Assert cached values are of same size
+    assert (M == _prev_m && N == _prev_n && K == _prev_k);
+    auto* kernel = DB ? matmulKernel3<BM, BN, BK, NUM_THREADS, true>
+            : matmulKernel3<BM, BN, BK, NUM_THREADS, false>;
+    size_t sMemSize = sizeof(SMem<BM, BN, BK>);
+    cudaCheck(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
+
+    kernel<<<(M/BM) * (N/BN), NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, DB);
+}
+
+} // namespace M3
+
+using M3::runKernel3;
+
+void sgemm_fastcu_handwritten_tma_wgmma_bf16(
+    const torch::Tensor &matrix_a,
+    const torch::Tensor &matrix_b_transposed,
+    torch::Tensor &output_matrix_transposed)
+{
+    TORCH_CHECK(matrix_a.device().is_cuda(), "Matrix A must be on CUDA device");
+    TORCH_CHECK(matrix_b_transposed.device().is_cuda(), "Matrix B^T must be on CUDA device");
+    TORCH_CHECK(output_matrix_transposed.device().is_cuda(), "Output C^T must be on CUDA device");
+
+    TORCH_CHECK(matrix_a.scalar_type() == at::kBFloat16, "Matrix A must be bfloat16");
+    TORCH_CHECK(matrix_b_transposed.scalar_type() == at::kBFloat16, "Matrix B^T must be bfloat16");
+    TORCH_CHECK(output_matrix_transposed.scalar_type() == at::kBFloat16, "Output C^T must be bfloat16");
+
+    TORCH_CHECK(matrix_a.dim() == 2 && matrix_b_transposed.dim() == 2, "A and B^T must be 2D tensors");
+    TORCH_CHECK(matrix_a.is_contiguous() && matrix_b_transposed.is_contiguous(),
+                "A and B^T must be contiguous");
+    TORCH_CHECK(output_matrix_transposed.is_contiguous(), "Output C^T must be contiguous");
+
+    const int M = static_cast<int>(matrix_a.size(0));
+    const int K = static_cast<int>(matrix_a.size(1));
+    const int N = static_cast<int>(matrix_b_transposed.size(0));
+    TORCH_CHECK(M % 128 == 0 && N % 128 == 0 && K % 64 == 0,
+                "Day 14 matmul_3 requires M,N multiples of 128 and K multiple of 64");
+    TORCH_CHECK(matrix_b_transposed.size(1) == K, "B^T must have shape N x K");
+    TORCH_CHECK(output_matrix_transposed.size(0) == N && output_matrix_transposed.size(1) == M,
+                "Output C^T must have shape N x M");
+
+    // Blank P - completion gate:
+    // Leave this as zero while any earlier blank still contains GEMM_TODO_*;
+    // fill it with 1 only after all blanks are complete so the real kernel
+    // runs instead of returning a safe zero output.
+    if (!GEMM_TODO_INT("Day 14: set to 1 after filling every blank")) {
+        output_matrix_transposed.zero_();
+        return;
+    }
+
+    auto *d_A = reinterpret_cast<bf16 *>(matrix_a.data_ptr<at::BFloat16>());
+    auto *d_Bt = reinterpret_cast<bf16 *>(matrix_b_transposed.data_ptr<at::BFloat16>());
+    auto *d_Ct = reinterpret_cast<bf16 *>(output_matrix_transposed.data_ptr<at::BFloat16>());
+
+    runKernel3(M, N, K, d_A, d_Bt, d_Ct, nullptr);
+}

@@ -9,9 +9,9 @@ Usage:
   scripts/upload_run_one_day.sh --day DAY [options]
 
 Options:
-  --day DAY           Day number: 1..26.
+  --day DAY           Day number: 1..19.
   --namespace NS      Kubernetes namespace. Default: $GEMM_NS or kk-flyte-adhoc
-  --pod POD           Pod name. Default: $GEMM_POD or a5fwvrxdqp6kcb4xfj5d-n0-0
+  --pod POD           Pod name. Default: $GEMM_POD or a7cqpbzcmb4v5mh2svnw-n0-0
   --remote-dir DIR    Remote directory. Default: $GEMM_REMOTE_DIR or /tmp/gemm-hard-way-challenge
   --container NAME    Optional container name for multi-container pods.
   --sizes "S..."      Space-separated matrix sizes. Overrides mode defaults.
@@ -24,7 +24,7 @@ Options:
   --tolerance VALUE   Max-error correctness tolerance. Default depends on dtype.
   --arch ARCH         nvcc GPU architecture. Default: current GPU capability.
   --result-dir DIR    Local folder for successful run logs. Default: challenge ./result
-  --with-cutlass      Upload CUTLASS headers for days 13-26.
+  --with-cutlass      Upload CUTLASS headers for days 13-19.
   --cutlass-dir DIR   CUTLASS checkout. Default: $CUTLASS_DIR, ./cutlass, ../LeetCUDA/cutlass.
   --verbose-build     Show PyTorch extension build output.
   -h, --help          Show this help.
@@ -41,7 +41,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 challenge_dir="$(cd "$script_dir/.." && pwd)"
 
 namespace="${GEMM_NS:-kk-flyte-adhoc}"
-pod="${GEMM_POD:-a5fwvrxdqp6kcb4xfj5d-n0-0}"
+pod="${GEMM_POD:-a7cqpbzcmb4v5mh2svnw-n0-0}"
 remote_dir="${GEMM_REMOTE_DIR:-/tmp/gemm-hard-way-challenge}"
 container=""
 day=""
@@ -165,20 +165,13 @@ case "$day" in
   10) day_file="10_kernel_tensorcore_warptiled.cu" ;;
   11) day_file="11_kernel_tensorcore_double_buffered.cu" ;;
   12) day_file="12_kernel_tensorcore_async.cu" ;;
-  13) day_file="13_kernel_cutlass.cu" ;;
-  14) day_file="14_kernel_cutlass_autotunable.cu" ;;
-  15) day_file="15_kernel_cutlass_hopper.cu" ;;
-  16) day_file="16_kernel_cutlass_hopper_autotunable.cu" ;;
-  17) day_file="17_kernel_hopper_tma_wgmma.cu" ;;
-  18) day_file="18_kernel_fastcu_matmul2_manual_tma_wgmma.cu" ;;
-  19) day_file="19_kernel_hopper_fastcu_big_tile.cu" ;;
-  20) day_file="20_kernel_hopper_fastcu_persistent.cu" ;;
-  21) day_file="21_kernel_hopper_fastcu_cluster.cu" ;;
-  22) day_file="22_kernel_fastcu_handwritten_tma_wgmma.cu" ;;
-  23) day_file="23_kernel_fastcu_cached_tma_maps.cu" ;;
-  24) day_file="24_kernel_fastcu_final.cu" ;;
-  25) day_file="25_kernel_fastcu_tma_store.cu" ;;
-  26) day_file="26_kernel_fastcu_hilbert_final.cu" ;;
+  13) day_file="13_kernel_fastcu_matmul2_manual_tma_wgmma.cu" ;;
+  14) day_file="14_kernel_fastcu_matmul3_big_tile.cu" ;;
+  15) day_file="15_kernel_fastcu_matmul4_warp_specialized.cu" ;;
+  16) day_file="16_kernel_fastcu_matmul6_persistent.cu" ;;
+  17) day_file="17_kernel_fastcu_matmul10_tma_store.cu" ;;
+  18) day_file="18_kernel_fastcu_matmul12_final.cu" ;;
+  19) day_file="19_kernel_cutlass3_hopper_tunable.cu" ;;
   *)
     echo "Unsupported day: $day" >&2
     exit 2
@@ -212,18 +205,6 @@ upload_files=(
   cuda/utils.cuh
   python/benchmark_one_day.py
 )
-if [[ "$day" -ge 23 ]]; then
-  upload_files+=(cuda/22_kernel_fastcu_handwritten_tma_wgmma.cu)
-fi
-if [[ "$day" -ge 24 ]]; then
-  upload_files+=(cuda/23_kernel_fastcu_cached_tma_maps.cu)
-fi
-if [[ "$day" -ge 25 ]]; then
-  upload_files+=(cuda/24_kernel_fastcu_final.cu)
-fi
-if [[ "$day" -ge 26 ]]; then
-  upload_files+=(cuda/25_kernel_fastcu_tma_store.cu)
-fi
 
 tar -C "$challenge_dir" -cf - "${upload_files[@]}" | \
   kubectl "${kubectl_args[@]}" exec -i "$pod" -- tar -C "$remote_dir" -xf -

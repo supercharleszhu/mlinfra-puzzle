@@ -30,20 +30,13 @@ DAY_SPECS = {
     10: ("10_kernel_tensorcore_warptiled.cu", "float16", "10_tensorcore_fp16", "sgemm_tensorcore_fp16", "fp32_then_cast"),
     11: ("11_kernel_tensorcore_double_buffered.cu", "float16", "11_tensorcore_db_fp16", "sgemm_tensorcore_double_buffered_fp16", "fp32_then_cast"),
     12: ("12_kernel_tensorcore_async.cu", "float16", "12_tensorcore_async_fp16", "sgemm_tensorcore_async_fp16", "fp32_then_cast"),
-    13: ("13_kernel_cutlass.cu", "float32", "13_cutlass_fp32", "sgemm_cutlass_fp32", "fp32_out"),
-    14: ("14_kernel_cutlass_autotunable.cu", "float16", "14_cutlass_autotune_fp16_cfg0", "sgemm_cutlass_autotune_fp16", "autotune_fp32_then_cast"),
-    15: ("15_kernel_cutlass_hopper.cu", "bfloat16", "15_cutlass_hopper_bf16", "sgemm_cutlass_hopper_bf16", "bf16_out"),
-    16: ("16_kernel_cutlass_hopper_autotunable.cu", "bfloat16", "16_cutlass_hopper_autotune_bf16_cfg0", "sgemm_cutlass_hopper_autotune_bf16", "hopper_autotune_bf16_out"),
-    17: ("17_kernel_hopper_tma_wgmma.cu", "bfloat16", "17_hopper_fastcu_tma_wgmma_bf16", "sgemm_cutlass_hopper_fastcu_tma_wgmma_bf16", "bf16_out"),
-    18: ("18_kernel_fastcu_matmul2_manual_tma_wgmma.cu", "bfloat16", "18_fastcu_matmul2_manual_tma_wgmma_bf16", "sgemm_fastcu_matmul2_manual_tma_wgmma_bf16", "fastcu_handwritten_bf16_out"),
-    19: ("19_kernel_hopper_fastcu_big_tile.cu", "bfloat16", "19_hopper_fastcu_big_tile_bf16", "sgemm_cutlass_hopper_fastcu_big_tile_bf16", "bf16_out"),
-    20: ("20_kernel_hopper_fastcu_persistent.cu", "bfloat16", "20_hopper_fastcu_persistent_bf16", "sgemm_cutlass_hopper_fastcu_persistent_bf16", "bf16_out"),
-    21: ("21_kernel_hopper_fastcu_cluster.cu", "bfloat16", "21_hopper_fastcu_cluster_bf16", "sgemm_cutlass_hopper_fastcu_cluster_bf16", "bf16_out"),
-    22: ("22_kernel_fastcu_handwritten_tma_wgmma.cu", "bfloat16", "22_fastcu_handwritten_tma_wgmma_bf16", "sgemm_fastcu_handwritten_tma_wgmma_bf16", "fastcu_handwritten_bf16_out"),
-    23: ("23_kernel_fastcu_cached_tma_maps.cu", "bfloat16", "23_fastcu_cached_tma_maps_bf16", "sgemm_fastcu_handwritten_cached_tma_maps_bf16", "fastcu_cached_bf16_out"),
-    24: ("24_kernel_fastcu_final.cu", "bfloat16", "24_fastcu_final_bf16", "sgemm_fastcu_final_bf16", "fastcu_cached_bf16_out"),
-    25: ("25_kernel_fastcu_tma_store.cu", "bfloat16", "25_fastcu_tma_store_bf16", "sgemm_fastcu_tma_store_bf16", "fastcu_cached_bf16_out"),
-    26: ("26_kernel_fastcu_hilbert_final.cu", "bfloat16", "26_fastcu_hilbert_final_bf16", "sgemm_fastcu_hilbert_final_bf16", "fastcu_cached_bf16_out"),
+    13: ("13_kernel_fastcu_matmul2_manual_tma_wgmma.cu", "bfloat16", "13_fastcu_matmul2_manual_tma_wgmma_bf16", "sgemm_fastcu_matmul2_manual_tma_wgmma_bf16", "fastcu_handwritten_bf16_out"),
+    14: ("14_kernel_fastcu_matmul3_big_tile.cu", "bfloat16", "14_fastcu_matmul3_big_tile_bf16", "sgemm_fastcu_handwritten_tma_wgmma_bf16", "fastcu_handwritten_bf16_out"),
+    15: ("15_kernel_fastcu_matmul4_warp_specialized.cu", "bfloat16", "15_fastcu_matmul4_warp_specialized_bf16", "sgemm_fastcu_handwritten_cached_tma_maps_bf16", "fastcu_cached_bf16_out"),
+    16: ("16_kernel_fastcu_matmul6_persistent.cu", "bfloat16", "16_fastcu_matmul6_persistent_bf16", "sgemm_fastcu_final_bf16", "fastcu_cached_bf16_out"),
+    17: ("17_kernel_fastcu_matmul10_tma_store.cu", "bfloat16", "17_fastcu_matmul10_tma_store_bf16", "sgemm_fastcu_tma_store_bf16", "fastcu_cached_bf16_out"),
+    18: ("18_kernel_fastcu_matmul12_final.cu", "bfloat16", "18_fastcu_matmul12_final_bf16", "sgemm_fastcu_hilbert_final_bf16", "fastcu_cached_bf16_out"),
+    19: ("19_kernel_cutlass3_hopper_tunable.cu", "bfloat16", "19_cutlass3_hopper_tunable_bf16", "sgemm_cutlass3_hopper_tunable_bf16", "bf16_out"),
 }
 
 EXPLORE_GEMM_SIZES = [64, 96, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192]
@@ -188,23 +181,11 @@ namespace cg = cooperative_groups;
 #include "cutlass/numeric_types.h"
 #include "cute/tensor.hpp"
 """
-        if day == 14:
-            functions.append("get_num_cutlass_configs")
-
     header_code = read_without_local_includes(cuda_dir / "gemm_kernels.cuh")
     utils_code = read_without_local_includes(cuda_dir / "utils.cuh")
     todo_code = read_without_local_includes(cuda_dir / "challenge_todo.cuh")
-    handwritten_code = ""
-    if day >= 23:
-        handwritten_code += "\n" + read_without_local_includes(source_dir / "22_kernel_fastcu_handwritten_tma_wgmma.cu")
-    if day >= 24:
-        handwritten_code += "\n" + read_without_local_includes(source_dir / "23_kernel_fastcu_cached_tma_maps.cu")
-    if day >= 25:
-        handwritten_code += "\n" + read_without_local_includes(source_dir / "24_kernel_fastcu_final.cu")
-    if day >= 26:
-        handwritten_code += "\n" + read_without_local_includes(source_dir / "25_kernel_fastcu_tma_store.cu")
     cuda_sources = (
-        todo_code + "\n" + utils_code + "\n" + handwritten_code + "\n" +
+        todo_code + "\n" + utils_code + "\n" +
         read_without_local_includes(source_path)
     )
     bindings = "\n".join(f'    m.def("{name}", &{name});' for name in functions)
@@ -394,9 +375,9 @@ def default_tolerance(dtype_name: str) -> float:
 
 def default_arch(day: int) -> str:
     major, minor = torch.cuda.get_device_capability(0)
-    if day >= 15:
+    if day >= 13:
         if major < 9:
-            raise RuntimeError("Days 15-26 require a Hopper GPU (SM90+) and should be built for sm_90a.")
+            raise RuntimeError("Days 13-19 require a Hopper GPU (SM90+) and should be built for sm_90a.")
         return "sm_90a"
     return f"sm_{major}{minor}"
 

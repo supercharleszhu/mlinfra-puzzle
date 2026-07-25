@@ -1,22 +1,25 @@
 # GEMM the Hard Way Standalone Challenge
 
-This folder is a standalone exercise path for learning GEMM implementation in two stages:
+This folder is a standalone exercise path for learning GEMM implementation in three chapters:
 
-1. Days 1-14 introduce the CUDA and CUTLASS concepts used by the original `gpusgobrr/explore-gemm` CUDA path.
-2. Days 15-26 move to Hopper-specific kernels: CUTLASS 3.x TMA/WGMMA first, then handwritten fast.cu-derived challenge days.
+1. Days 1-12 build a CUDA GEMM from naive FP32 through asynchronous Tensor Cores.
+2. Days 13-18 form Chapter 2: handwritten Hopper optimization without CUTLASS, based on fast.cu-style TMA/WGMMA kernels. https://www.aleksagordic.com/blog/matmul
+3. Day 19 forms Chapter 3: CUTLASS 3.x Hopper configuration and tuning, following https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way-2/
 
 References:
 
 - CUTLASS intro blog: https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way/
+- CUTLASS Hopper blog: https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way-2/
+- Inside nvidia gpu: https://www.aleksagordic.com/blog/matmul
 - explore-gemm source: https://github.com/gpusgobrr/explore-gemm/tree/main/cuda
 - CUTLASS official SM90 kernel headers: https://github.com/NVIDIA/cutlass/tree/main/include/cutlass/gemm/kernel
 - Hopper fast.cu-style blog notes: BF16 H100 matmul path with WGMMA, TMA, persistent scheduling, clusters, and L2-aware scheduling.
 
-Each CUDA file from `01` through `26` is included under `cuda/`. Days 1-14 keep selected `GEMM_TODO_*` expression blanks. Days 15-17 are CUTLASS/Hopper design puzzles, Day 18 introduces handwritten fast.cu matmul_2-style TMA/WGMMA, Days 19-21 continue the CUTLASS-facing fast.cu schedule analogues, and Days 22-26 walk through the later handwritten fast.cu path.
+Each CUDA file from `01` through `19` is included under `cuda/`. Days 1-12 cover CUDA through Tensor Core async pipelining, Days 13-18 are handwritten Hopper optimization exercises, and Day 19 expresses the Hopper path through CUTLASS 3.
 
 ## Day map
 
-### Days 1-14: CUDA-to-CUTLASS introduction
+### Days 1-12: CUDA GEMM foundations
 
 | Path | Purpose |
 | --- | --- |
@@ -32,37 +35,34 @@ Each CUDA file from `01` through `26` is included under `cuda/`. Days 1-14 keep 
 | `cuda/10_kernel_tensorcore_warptiled.cu` | WMMA plus block/warp tiling. |
 | `cuda/11_kernel_tensorcore_double_buffered.cu` | Tensor Core double buffering. |
 | `cuda/12_kernel_tensorcore_async.cu` | Async pipeline variant. |
-| `cuda/13_kernel_cutlass.cu` | CUTLASS 2.x GEMM wrapper. |
-| `cuda/14_kernel_cutlass_autotunable.cu` | CUTLASS autotuning configs. |
 
-### Days 15-26: Hopper optimization with CUTLASS and handwritten fast.cu machinery
+### Days 13-18: Chapter 2 - handwritten Hopper optimization
 
-These days use CUTLASS 3.x APIs that instantiate `cutlass::gemm::kernel::GemmUniversal` from the official `include/cutlass/gemm/kernel` SM90 family:
+These days avoid CUTLASS and focus on the mechanics hidden by libraries: TMA tensor maps, barriers, WGMMA descriptors/instructions, cached tensor maps, TMA store, and Hilbert scheduling.
 
-- `sm90_gemm_tma_warpspecialized.hpp`
-- `sm90_gemm_tma_warpspecialized_pingpong.hpp`
-- `sm90_gemm_tma_warpspecialized_cooperative.hpp`
-- `tile_scheduler.hpp` / `tile_scheduler_params.h`
-
-The sequence mirrors the pasted H100 blog at the level CUTLASS exposes directly:
-
-| Path | Hopper focus |
+| Path | Handwritten Hopper focus |
 | --- | --- |
-| `cuda/15_kernel_cutlass_hopper.cu` | Choose between CUTLASS SM90 TMA warp-specialized schedules: basic, persistent/cooperative, ping-pong, and Stream-K. |
-| `cuda/16_kernel_cutlass_hopper_autotunable.cu` | Expose tile shape, raster order, decomposition mode, swizzle, and split count as runtime autotuning knobs. |
-| `cuda/17_kernel_hopper_tma_wgmma.cu` | Blog kernel 2 analogue: first BF16 Hopper TMA + WGMMA tile through CUTLASS `GemmUniversal`. |
-| `cuda/18_kernel_fastcu_matmul2_manual_tma_wgmma.cu` | fast.cu matmul_2 analogue: manually apply 2D TMA loads, barriers, WGMMA m64n64k16, and C^T stores. |
-| `cuda/19_kernel_hopper_fastcu_big_tile.cu` | Blog kernel 3/5 analogue: scale to a 128x256x64 tile to increase WGMMA work per CTA. |
-| `cuda/20_kernel_hopper_fastcu_persistent.cu` | Blog kernel 6 analogue: persistent scheduling so CTAs pull multiple output tiles and improve residency/load balance. |
-| `cuda/21_kernel_hopper_fastcu_cluster.cu` | Blog kernel 8 analogue: 2x1 CTA cluster using cooperative SM90 schedules, the CUTLASS-facing version of cluster/TMA-multicast reasoning. |
-| `cuda/22_kernel_fastcu_handwritten_tma_wgmma.cu` | Blog kernel 12 analogue: handwritten WGMMA/TMA, TMA store, stmatrix staging, and Hilbert scheduling. |
-| `cuda/23_kernel_fastcu_cached_tma_maps.cu` | fast.cu benchmark assumption: stable A/B/C allocations and cached TMA tensor maps. |
-| `cuda/24_kernel_fastcu_final.cu` | final fast.cu-style benchmark target for 4096/8192 comparisons. |
-| `cuda/25_kernel_fastcu_tma_store.cu` | handwritten epilogue focus: stmatrix into shared memory followed by TMA store. |
-| `cuda/26_kernel_fastcu_hilbert_final.cu` | handwritten scheduling focus: Hilbert tile order and final benchmark analysis. |
+| `cuda/13_kernel_fastcu_matmul2_manual_tma_wgmma.cu` | fast.cu matmul_2 analogue: manually apply 2D TMA loads, barriers, WGMMA m64n64k16, and C^T stores. |
+| `cuda/14_kernel_fastcu_matmul3_big_tile.cu` | fast.cu matmul_3: larger BM/BN output tiles and wider WGMMA_N shapes. |
+| `cuda/15_kernel_fastcu_matmul4_warp_specialized.cu` | fast.cu matmul_4: warp-specialized producer/consumer overlap for TMA loads and WGMMA compute. |
+| `cuda/16_kernel_fastcu_matmul6_persistent.cu` | fast.cu matmul_6: persistent tile processing and steady-state overlap. |
+| `cuda/17_kernel_fastcu_matmul10_tma_store.cu` | fast.cu matmul_10: accumulator conversion, stmatrix staging, and TMA store. |
+| `cuda/18_kernel_fastcu_matmul12_final.cu` | fast.cu matmul_12: final combined handwritten kernel and benchmark analysis. |
 | `LICENSE.fastcu` | MIT license for the fast.cu-derived source. |
 
 The handwritten fast.cu ports use fast.cu's B^T/C^T layout convention: the Python wrapper passes `B.t().contiguous()` to the kernel and returns a transposed view of the output buffer.
+
+### Day 19: Chapter 3 - CUTLASS 3 Hopper
+
+The CUTLASS chapter intentionally skips the CUTLASS 2.x baseline. One tunable
+SM90 `CollectiveBuilder` lesson covers the Hopper blog's full progression:
+TMA/WGMMA warp specialization, stage count, thread-block clusters, persistent
+cooperative and ping-pong schedules, Stream-K, rasterization, swizzle, and
+decomposition tuning.
+
+| Path | CUTLASS focus |
+| --- | --- |
+| `cuda/19_kernel_cutlass3_hopper_tunable.cu` | CUTLASS 3 SM90 kernel with blanks for schedule, stages, tile/cluster shape, raster order, decomposition, swizzle, and splits. |
 
 ## Layout
 
@@ -99,7 +99,7 @@ python3 solutions/python/benchmark_solution.py --sizes 128 256 --dtype float32
 python3 solutions/python/benchmark_solution.py --sizes 128 256 --dtype float16
 ```
 
-By default the solution runner builds files 01-12. To also build CUTLASS files 13-14, run from a LeetCUDA checkout that has `./cutlass` populated, or set `CUTLASS_DIR`, then pass `--include-cutlass`. On Hopper GPUs (SM90+), `--include-cutlass` also builds days 15-26 with `sm_90a`.
+By default the solution runner builds files 01-12. Pass `--include-cutlass` to build the Hopper/CUTLASS chapters, days 13-19; on Hopper GPUs these build with `sm_90a`.
 
 For remote GPU execution through Kubernetes, see [`REMOTE_POD_GUIDE.md`](./REMOTE_POD_GUIDE.md).
 
@@ -112,13 +112,11 @@ scripts/run_remote_matrix.sh --day 9 --sizes "128 256" --iters 50
 scripts/run_remote_matrix.sh --day 14 --with-cutlass
 scripts/upload_run_one_day.sh --day 15 --with-cutlass
 scripts/upload_run_one_day.sh --day 18 --with-cutlass --sizes "1024 2048 4096"
-scripts/upload_run_one_day.sh --day 21 --with-cutlass --sizes "1024 2048 4096"
-scripts/upload_run_one_day.sh --day 22 --with-cutlass --sizes "4096 8192"
-scripts/upload_run_one_day.sh --day 26 --with-cutlass --sizes "4096 8192"
+scripts/upload_run_one_day.sh --day 19 --with-cutlass --sizes "1024 2048 4096"
 scripts/run_remote_matrix.sh --all --skip-upload
 ```
 
 ## Attribution
 
 The original explore-gemm implementation is licensed under Apache License 2.0; a copy is included as `LICENSE.upstream`.
-Days 18 and 22-26 include code or exercises adapted from the MIT-licensed fast.cu repository; the license is included as `LICENSE.fastcu`.
+Days 13-18 include code or exercises adapted from the MIT-licensed fast.cu repository; the license is included as `LICENSE.fastcu`.

@@ -24,24 +24,16 @@ CUDA_FILES_BASE = [
     "12_kernel_tensorcore_async.cu",
 ]
 
-CUDA_FILES_CUTLASS = [
-    "13_kernel_cutlass.cu",
-    "14_kernel_cutlass_autotunable.cu",
-]
+CUDA_FILES_CUTLASS = []
 
 CUDA_FILES_HOPPER = [
-    "15_kernel_cutlass_hopper.cu",
-    "16_kernel_cutlass_hopper_autotunable.cu",
-    "17_kernel_hopper_tma_wgmma.cu",
-    "18_kernel_fastcu_matmul2_manual_tma_wgmma.cu",
-    "19_kernel_hopper_fastcu_big_tile.cu",
-    "20_kernel_hopper_fastcu_persistent.cu",
-    "21_kernel_hopper_fastcu_cluster.cu",
-    "22_kernel_fastcu_handwritten_tma_wgmma.cu",
-    "23_kernel_fastcu_cached_tma_maps.cu",
-    "24_kernel_fastcu_final.cu",
-    "25_kernel_fastcu_tma_store.cu",
-    "26_kernel_fastcu_hilbert_final.cu",
+    "13_kernel_fastcu_matmul2_manual_tma_wgmma.cu",
+    "14_kernel_fastcu_matmul3_big_tile.cu",
+    "15_kernel_fastcu_matmul4_warp_specialized.cu",
+    "16_kernel_fastcu_matmul6_persistent.cu",
+    "17_kernel_fastcu_matmul10_tma_store.cu",
+    "18_kernel_fastcu_matmul12_final.cu",
+    "19_kernel_cutlass3_hopper_tunable.cu",
 ]
 
 FUNCTIONS_BASE = [
@@ -64,29 +56,11 @@ FUNCTIONS_BASE = [
     "sgemm_tensorcore_async_bf16",
 ]
 
-FUNCTIONS_CUTLASS = [
-    "sgemm_cutlass_fp16",
-    "sgemm_cutlass_bf16",
-    "sgemm_cutlass_fp32",
-    "sgemm_cutlass_autotune_fp16",
-    "sgemm_cutlass_autotune_bf16",
-    "get_num_cutlass_configs",
-]
+FUNCTIONS_CUTLASS = []
 
 FUNCTIONS_HOPPER = [
-    "sgemm_cutlass_hopper_bf16",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_auto",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_constant",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_persistent_constant",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_pingpong_constant",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_auto",
-    "sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_constant",
-    "sgemm_cutlass_hopper_autotune_bf16",
-    "sgemm_cutlass_hopper_fastcu_tma_wgmma_bf16",
+    "sgemm_cutlass3_hopper_tunable_bf16",
     "sgemm_fastcu_matmul2_manual_tma_wgmma_bf16",
-    "sgemm_cutlass_hopper_fastcu_big_tile_bf16",
-    "sgemm_cutlass_hopper_fastcu_persistent_bf16",
-    "sgemm_cutlass_hopper_fastcu_cluster_bf16",
     "sgemm_fastcu_handwritten_tma_wgmma_bf16",
     "sgemm_fastcu_handwritten_cached_tma_maps_bf16",
     "sgemm_fastcu_final_bf16",
@@ -149,7 +123,7 @@ def create_solution_extension(
     """Compile and load the solution extension.
 
     By default this builds files 01-12, which do not require CUTLASS headers.
-    Pass include_cutlass=True to also build files 13-26.
+    Pass include_cutlass=True to also build files 13-19.
     """
 
     file_dir = Path(__file__).resolve().parents[1] / "cuda"

@@ -82,97 +82,8 @@ void sgemm_tensorcore_async_fp16(const torch::Tensor &matrix_a, const torch::Ten
 void sgemm_tensorcore_async_bf16(const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
                                  torch::Tensor &output_matrix, float alpha, float beta);
 
-// SGEMM with CUTLASS library
-// Input: FP16, BF16, or FP32, Output: FP32
-// Uses NVIDIA CUTLASS library for highly optimized operations:
-//  - FP16/BF16: Tensor Core operations
-//  - FP32: SIMT operations
-void sgemm_cutlass_fp16(const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                        torch::Tensor &output_matrix, float alpha, float beta);
-
-void sgemm_cutlass_bf16(const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                        torch::Tensor &output_matrix, float alpha, float beta);
-
-void sgemm_cutlass_fp32(const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                        torch::Tensor &output_matrix, float alpha, float beta);
-
-// SGEMM with CUTLASS library - Autotunable configurations
-// Input: FP16 or BF16, Output: FP32
-// Supports multiple tile configurations selected by config_id
-// Use get_num_cutlass_configs() to get the total number of available configs
-void sgemm_cutlass_autotune_fp16(int config_id, const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                                 torch::Tensor &output_matrix, float alpha, float beta);
-
-void sgemm_cutlass_autotune_bf16(int config_id, const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                                 torch::Tensor &output_matrix, float alpha, float beta);
-
-int get_num_cutlass_configs();
-
-// SGEMM with CUTLASS library - Hopper architecture (SM90) with Collective Builder API
-// Input: BF16 only (FP16 not supported), Output: BF16
-// Uses CUTLASS 3.x Collective Builder API optimized for H100 GPUs
-// Requires Hopper architecture (SM 9.0+) with TMA (Tensor Memory Accelerator) support
-// Note: alpha=1.0, beta=0.0 are hard-coded
-
-// Default variant (backward compatibility) - uses Pingpong with constant stage count
-void sgemm_cutlass_hopper_bf16(const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-                                torch::Tensor &output_matrix);
-
-// TMA Warp Specialized variants
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_auto(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_constant(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-// TMA Warp Specialized Persistent variants
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_persistent_auto(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_persistent_constant(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-// TMA Warp Specialized Pingpong variants
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_pingpong_auto(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_pingpong_constant(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-// TMA Warp Specialized Stream-K variants
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_auto(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_bf16_tma_warp_specialized_streamk_constant(
-    const torch::Tensor &matrix_a, const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-// SGEMM with CUTLASS library - Hopper architecture (SM90) Autotunable version
-// Input: BF16 only (FP16 not supported), Output: FP32
-// Uses CUTLASS 3.x Collective Builder API with configurable tile and cluster shapes
-// Requires Hopper architecture (SM 9.0+) with TMA (Tensor Memory Accelerator) support
-// Note: alpha=1.0, beta=0.0 are hard-coded
-// Use get_num_cutlass_hopper_configs() to get the total number of available configs
-void sgemm_cutlass_hopper_autotune_bf16(
-    const int tile_size,
-    const int raster_order,
-    const int decomposition,
-    const int swizzle,
-    const int splits,
-    const torch::Tensor &matrix_a,
-    const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-// SGEMM with CUTLASS library - Hopper architecture (SM90) fast.cu-inspired steps
-// Input: BF16 only, Output: BF16
-void sgemm_cutlass_hopper_fastcu_tma_wgmma_bf16(
+// CUTLASS 3.x Hopper (SM90) TMA/WGMMA GEMM with tunable schedules.
+void sgemm_cutlass3_hopper_tunable_bf16(
     const torch::Tensor &matrix_a,
     const torch::Tensor &matrix_b,
     torch::Tensor &output_matrix);
@@ -181,21 +92,6 @@ void sgemm_fastcu_matmul2_manual_tma_wgmma_bf16(
     const torch::Tensor &matrix_a,
     const torch::Tensor &matrix_b_transposed,
     torch::Tensor &output_matrix_transposed);
-
-void sgemm_cutlass_hopper_fastcu_big_tile_bf16(
-    const torch::Tensor &matrix_a,
-    const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_fastcu_persistent_bf16(
-    const torch::Tensor &matrix_a,
-    const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
-
-void sgemm_cutlass_hopper_fastcu_cluster_bf16(
-    const torch::Tensor &matrix_a,
-    const torch::Tensor &matrix_b,
-    torch::Tensor &output_matrix);
 
 // Handwritten fast.cu-derived Hopper kernel.
 // Expects B^T and writes C^T because the upstream kernel uses column-major B/C views.

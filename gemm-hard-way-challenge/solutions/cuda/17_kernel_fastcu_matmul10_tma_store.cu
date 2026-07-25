@@ -1,52 +1,44 @@
+// GEMM the Hard Way, Day 17.
+// Flattened from fast.cu examples/matmul/matmul_10.cuh without borrowing later kernels.
+// New concept: 3D TMA maps, thread-block clusters, multicast loads, and a TMA-store epilogue replace direct global stores.
+//
+// Day 16 made CTAs persistent, but every CTA still loaded its own A/B tiles
+// and each consumer stored accumulator registers directly to global memory.
+// Day 17 groups two CTAs into a cluster along M:
+//   - the CTAs compute different BM-row tiles at the same BN-column tile;
+//   - their B^T tile is identical, so one TMA load multicasts B to both CTAs;
+//   - their A tiles differ because their M coordinates differ.
+//
+// The output path also changes:
+//   FP32 accumulators -> BF16 shared-memory C tile -> TMA store to global C^T.
+// This requires a third tensor map for C and synchronization before the single
+// store-issuing thread launches the asynchronous shared-to-global transfer.
 
-// GEMM the Hard Way challenge edition.
-// Day 22 blank focus: port a handwritten fast.cu Hopper kernel.
-//
-// This file is adapted from fast.cu's MIT-licensed examples/matmul/matmul_12.cuh.
-// See ../LICENSE.fastcu for the upstream license and copyright notice.
-//
-// The handwritten kernel uses:
-//   - WGMMA m64n256k16 BF16->FP32 assembly
-//   - TMA global->shared loads and TMA shared->global stores
-//   - 2x1 CTA clusters and multicast loads
-//   - persistent Hilbert scheduling
-//   - stmatrix to move accumulator fragments into the TMA-store shared layout
-//
-// FILL-IN BLANKS FOR THIS FILE
-//   [ ] Blank A: trace the producer warpgroup TMA load loop.
-//   [ ] Blank B: trace the two consumer warpgroups and their WGMMA register tiles.
-//   [ ] Blank C: explain why output is staged through shared memory before TMA store.
-//   [ ] Blank D: explain why the Python wrapper passes B^T and returns C^T.
-//   [ ] Blank E: benchmark N=4096/8192 against torch and Days 17-20.
-
-using std::max;
 typedef __nv_bfloat16 bf16;
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 
-inline void fastcu_cuda_check(cudaError_t error, const char *file, int line) {
+inline void day17_cuda_check(cudaError_t error, const char *file, int line) {
     if (error != cudaSuccess) {
         printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
         assert(false);
     }
 }
-#define cudaCheck(err) (fastcu_cuda_check(err, __FILE__, __LINE__))
+#define cudaCheck(err) (day17_cuda_check(err, __FILE__, __LINE__))
 
-namespace M12 {
+namespace M10 {
 
-__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
-    return (((x) & 0x3FFFF) >> 0x4);
-}
+__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
-// Descriptor for a shared memory matrix.
-// Implementation is derived from PTX guide: https://docs.nvidia.com/cuda/parallel-thread-execution/#matrix-descriptor-format
 __device__ uint64_t make_smem_desc(bf16* ptr) {
-    // Convert shared memory pointer to integer
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    uint64_t desc = matrix_descriptor_encode(addr);
+    uint64_t desc = 0x0000000000000000;
+    desc |= matrix_descriptor_encode(addr);
     desc |= matrix_descriptor_encode((uint64_t)16) << 16;
     desc |= matrix_descriptor_encode((uint64_t)1024) << 32;
     desc |= 1llu << 62; // 128B swizzle
     return desc;
 }
+
 
 __device__ void warpgroup_arrive() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -56,22 +48,35 @@ __device__ void warpgroup_commit_batch() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
+template <int N>
 __device__ void warpgroup_wait() {
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
-template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, bool padding=false>
+template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
 __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
     static_assert(BlockMinorSize >= 64);
     assert(global_width % 64 == 0);
+    // Blank A - contiguous chunk width:
+    // A 128-byte swizzle covers 64 BF16 values, so the first TMA dimension is
+    // exactly 64 elements. Larger logical widths are split into 64-element
+    // chunks along the third dimension.
     uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
+    // Blanks B and C - strides for the 3D view:
+    // Dimension 1 advances one matrix row, requiring global_width BF16 values
+    // in bytes: sizeof(bf16) * global_width. Dimension 2 advances one
+    // 64-element column chunk, requiring 64 * sizeof(bf16) bytes.
     uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 64*sizeof(bf16), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {padding ? 72 : 64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
+    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
+        // Blank D - tensor rank:
+        // The logical coordinates are [within-64-chunk, row, chunk-index], so
+        // this map has rank 3 rather than Day 16's rank-2 [column, row] map.
         &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address, gmem_prob_shape,
         gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -206,15 +211,64 @@ __device__ __forceinline__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
 
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ __forceinline__ void wgmma64(float d[4][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31},"
+        " %32,"
+        " %33,"
+        " %34, %35, %36, %37, %38;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
+            "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
+            "+f"(d[3][6]), "+f"(d[3][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ __forceinline__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
+    uint64_t desc_a = make_smem_desc(&sA[0]);
+    uint64_t desc_b = make_smem_desc(&sB[0]);
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15},  "
+        " %16,"
+        " %17,"
+        " %18, %19, %20, %21, %22;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7])
+        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
-    static_assert(WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
+    static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 208 || WGMMA_N == 256);
     if  constexpr (WGMMA_N == 256)
         wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
     if  constexpr (WGMMA_N == 192)
         wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
     if  constexpr (WGMMA_N == 128)
         wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+    if constexpr (WGMMA_N == 64)
+        wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+    if constexpr (WGMMA_N == 32)
+        wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
 template <uint32_t RegCount>
@@ -228,7 +282,7 @@ __device__ void warpgroup_reg_dealloc() {
 }
 
 __device__ static __forceinline__ void init_barrier(uint64_t* bar, int thread_count, int transaction_count) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     asm volatile (
         "mbarrier.init.shared::cta.b64 [%0], %1;\n"
         :: "r"(bar_ptr), "r"(thread_count+transaction_count)
@@ -236,7 +290,7 @@ __device__ static __forceinline__ void init_barrier(uint64_t* bar, int thread_co
 }
 
 __device__ static __forceinline__ void expect_bytes(uint64_t* bar, uint32_t bytes) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     asm volatile ("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
         :: "r"(bar_ptr), "r"(bytes));
 }
@@ -246,12 +300,9 @@ __device__ static inline void load_async(bf16 *dst, void const* src_tma_map, uin
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
-    // We use 3d tiling to load from GMEM to SMEM. 2d tiling only works for tiles <= 64 columns.
-    // For larger tiles, we need 3d tiling:
-    // First dimension: 64 (columns)
-    // Second dimension: Row
-    // Third dimension: Column / 64
-    // I spent a lot of time figuring this out. Hope this gets documented at some point.
+    // TMA coordinates are {0, row, column/64}. Coordinate zero selects the
+    // start inside a 64-element chunk; the third coordinate selects which
+    // chunk contains global_col_idx.
     asm volatile (
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4, %5}], [%2];"
@@ -266,6 +317,8 @@ __device__ static inline void store_async(void const* dst_tma_map, bf16 *src, in
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst_tma_map);
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(src));
 
+    // This is the reverse direction of load_async: one complete shared-memory
+    // tile is written to global memory using the output tensor map.
     asm volatile (
         "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
         " [%0, {%2, %3, %4}], [%1];"
@@ -278,7 +331,6 @@ __device__ static inline void store_async(void const* dst_tma_map, bf16 *src, in
 
 __device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    // Call mbarrier.try_wait in a while loop till it returns true.
     asm volatile (
         "{\n"
         ".reg .pred                P1;\n"
@@ -294,7 +346,7 @@ __device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
 }
 
 __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     asm volatile (
         "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
         :
@@ -303,17 +355,20 @@ __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
     );
 }
 
-__device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    // Call arrive on barrier stored in SM number `cta_id`
-    // Use mapa.shared instruction to access other SM's barrier.
-    asm volatile(
+__device__ static __forceinline__ void wait_cluster(uint64_t* bar, int kPhaseBit) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile (
         "{\n"
-        ".reg .b32 remAddr32;\n"
-        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n"
-        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n"
-        "}"
-        :: "r"(smem_addr), "r"(cta_id), "r"(count));
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
+        "@P1                       bra.uni DONE;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n"
+        :: "r"(mbar_ptr),
+        "r"(kPhaseBit)
+    );
 }
 
 __device__ static inline void load_async_multicast(bf16 *dst, void const* src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx, uint16_t cluster_mask) {
@@ -331,32 +386,48 @@ __device__ static inline void load_async_multicast(bf16 *dst, void const* src_tm
     );
 }
 
+__device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    // mapa.shared::cluster converts this CTA's shared address into the address
+    // of the corresponding barrier in cluster CTA cta_id. This lets consumers
+    // release queue stages in every CTA that received multicast data.
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(count));
+}
+
 template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
-constexpr int SPACE_LEN = 128;
-int *_dspace;
-
 template<int NUM_SM, int BM, int BN, int TM, int TN>
-struct Schedule<2, NUM_SM, BM, BN, TM, TN> {
+struct Schedule<1, NUM_SM, BM, BN, TM, TN> {
+    int block;
     int it;
-    int *space;
+    int total_blocks_m, total_blocks_n;
 
-    __device__ __forceinline__ Schedule(int M, int N, int block, int *_space) {
+    __device__ __forceinline__ Schedule(int M, int N, int _block) {
+        block = _block;
         it = 0;
-        space = _space;
+        total_blocks_m = CEIL_DIV(M, BM);
+        total_blocks_n = CEIL_DIV(N, BN);
+        assert(CEIL_DIV(M, BM)%TM == 0 && total_blocks_n%TN == 0);
     }
 
     __device__ __forceinline__ bool next(int &block_m, int& block_n) {
-        if (it >= SPACE_LEN) {
-            return false;
-        }
-        int now = space[it];
-        if (now == -1) {
-            return false;
-        }
-        block_m = now >> 16;
-        block_n = (now & ((1<<16)-1));
+        int num = it*NUM_SM + block;
+        if (num >= total_blocks_m*total_blocks_n) {return false;}
+
+        int cur_tile = num / (TM*TN);
+        int cur_tile_pos = num % (TM*TN);
+        block_m = TM*(cur_tile / (total_blocks_n/TN));
+        block_n = TN*(cur_tile % (total_blocks_n/TN));
+        block_m += cur_tile_pos / TN;
+        block_n += cur_tile_pos % TN;
         ++it;
         return true;
     }
@@ -366,17 +437,15 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*(BM+(BM/64)*8)]; // padding of 8 elements per consumer
+    alignas(128) bf16 C[BN*BM];
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-    int space[SPACE_LEN];
 };
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel12(int M, int N, int K, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel10(int M, int N, int K, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
-    constexpr int B_WG_M_PADDED = B_WG_M + 8;
     constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
     assert((M / BM) % CLUSTER_M == 0);
     assert((N / BN) % CLUSTER_N == 0);
@@ -385,12 +454,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
     bf16 *sA = s.A, *sB = s.B, *sC = s.C;
     uint64_t *full = s.full, *empty = s.empty;
-    int *space = s.space;
 
     uint32_t rank;
     asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
-    // Load schedule for this SM
-    if (threadIdx.x < SPACE_LEN) space[threadIdx.x] = dspace[rank*SPACE_LEN+threadIdx.x];
 
     const int num_blocks_k = K / BK;
     int wg_idx = threadIdx.x / 128;
@@ -405,9 +471,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
     asm volatile("barrier.cluster.arrive;\n" : :);
     asm volatile("barrier.cluster.wait;\n" : :);
 
+    // Blanks E and F - clustered scheduling dimensions:
+    // Day 16 scheduled a 16x8 macro-tile of individual CTA tiles. One Day 17
+    // schedule item now represents an entire CLUSTER_M-by-CLUSTER_N cluster,
+    // so use 16/CLUSTER_M schedule rows and 8/CLUSTER_N schedule columns.
+    Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTER_M, BN*CLUSTER_N, 16/CLUSTER_M, 8/CLUSTER_N> schedule(M, N, rank);
 
-    Schedule<2, NUM_SM/CLUSTERS, BM*CLUSTER_M, BN*CLUSTER_N, 16/CLUSTER_M, 8/CLUSTER_N> schedule(M, N, rank, &space[0]);
-
+    // clusterid.x identifies the cluster for persistent scheduling. After the
+    // schedule is constructed, cluster_ctarank identifies this CTA's position
+    // inside that cluster and is split into its M/N coordinates.
     asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
     uint32_t rank_m = rank / CLUSTER_N;
     uint32_t rank_n = rank % CLUSTER_N;
@@ -427,11 +499,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             while (schedule.next(num_block_m, num_block_n)) {
                 num_block_n = num_block_n * CLUSTER_N + rank_n;
                 num_block_m = num_block_m * CLUSTER_M + rank_m;
-                
+
                 for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
                     if (qidx == QSIZE) { qidx = 0; p ^= 1;}
                     wait(&empty[qidx], p);
-                    
+
+                    // Blank G - bytes completing full[qidx]:
+                    // Each CTA receives one BK-by-BM A tile and one BK-by-BN
+                    // B tile, even when B is delivered by multicast. Expect
+                    // (BK*BN + BK*BM) * sizeof(bf16) bytes.
                     expect_bytes(&full[qidx], (BK*BN+BK*BM)*sizeof(bf16));
                     if constexpr (CLUSTER_N > 1) {
                         uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
@@ -443,6 +519,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
 
                     if constexpr (CLUSTER_M > 1) {
+                        // CTAs separated along M share the same N coordinate,
+                        // so they need the same B^T tile. Only rank_m==0 issues
+                        // the load; col_mask multicasts it to all M ranks.
                         if (rank_m == 0) {
                             load_async_multicast(&sB[qidx*BK*BN], &tensorMapB, &full[qidx], block_k_iter*BK, num_block_n*BN, col_mask << rank_n);
                         }
@@ -458,21 +537,16 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
         --wg_idx;
         for (int qidx = 0; qidx < QSIZE; ++qidx) {
+            // Blank H - one arrival target per cluster CTA:
+            // Fill the bound with CLUSTERS. Consumer threads tid=0..CLUSTERS-1
+            // each target one cluster CTA, priming that CTA's empty barrier.
+            // The same expression is used below when releasing a consumed
+            // stage, ensuring every multicast recipient may reuse its slot.
             if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
         }
         int p = 0;
         int qidx = 0;
         int num_block_m, num_block_n;
-
-        // stmatrix and wgmma layouts match for BF16:
-        // 1) 9.7.14.5.16 Warp-level matrix store instruction: stmatrix
-        // 2) Figure 148: WGMMA .m64nNk16 register fragment layout for accumulator matrix D
-        int lane = tid % 32, warp = tid / 32;
-        bf16* block_sC = sC + wg_idx*B_WG_M_PADDED*BN;
-        uint32_t tid_offset = warp*16 + (lane % 8) * B_WG_M_PADDED; // offset for x1 stmatrix
-        tid_offset += (lane/16)*B_WG_M_PADDED*8 + (lane & 8); // row & column offsets for .x4 on stmatrix
-        uint32_t base_addr = static_cast<uint32_t>(__cvta_generic_to_shared(block_sC)) + tid_offset * sizeof(bf16);
-
         while (schedule.next(num_block_m, num_block_n)) {
             num_block_n = num_block_n * CLUSTER_N + rank_n;
             num_block_m = num_block_m * CLUSTER_M + rank_m;
@@ -504,7 +578,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
-                warpgroup_wait();
+                warpgroup_wait<0>();
+                // Blank H again: release this stage in every cluster CTA after
+                // all WGMMA reads from the first K tile are complete.
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
                 ++qidx;
             }
@@ -527,140 +603,103 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
-                warpgroup_wait();
+                warpgroup_wait<0>();
+                // Blank H again: identical release for later K tiles.
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
             }
 
             asm volatile("cp.async.bulk.wait_group 0;");
 
-            bf16 d_bf16[8];
-            int* data_ptr = (int*)d_bf16;
+            // Convert each consumer's FP32 registers to BF16 and assemble its
+            // rows in shared C. Both consumers write disjoint halves of sC.
+            int lane = tid % 32, warp = tid / 32;
+            int row = warp*16 + lane / 4;
+
+            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+            #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+                int yo = m_it*WGMMA_M;
+                #pragma unroll
                 for (int w = 0; w < WGMMA_N; w+=16) {
-                    uint32_t addr = base_addr + (w*B_WG_M_PADDED + m_it*WGMMA_M) * sizeof(bf16);
-                    for (int k = 0; k < 8; k++) {
-                        d_bf16[k] = __float2bfloat16(d[m_it][w/16][k]);
-                    }
-                    asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared::cta.b16 [%0], {%1, %2, %3, %4};"
-                                :: "r"(addr), "r"(data_ptr[0]), "r"(data_ptr[1]), "r"(data_ptr[2]), "r"(data_ptr[3]));
+                    int col = w + 2*(tid % 4);
+                    #define ST(i, j, v) block_sC[(j)*B_WG_M + (i) + yo] = v
+
+                    ST(row, col, d[m_it][w/16][0]);
+                    ST(row+8, col, d[m_it][w/16][2]);
+
+
+                    ST(row, col+1, d[m_it][w/16][1]);
+                    ST(row+8, col+1, d[m_it][w/16][3]);
+
+
+                    ST(row, col+8, d[m_it][w/16][4]);
+                    ST(row+8, col+8, d[m_it][w/16][6]);
+
+
+                    ST(row, col+9, d[m_it][w/16][5]);
+                    ST(row+8, col+9, d[m_it][w/16][7]);
+
+
+                    // #undef IDX
+                    #undef ST
                 }
             }
-            asm volatile("bar.sync %0, 128;\n" ::"r"(wg_idx + 2) : "memory");
-            if (tid == 0) {
-                store_async(&tensorMapC, block_sC, num_block_m*BM + wg_idx*B_WG_M, num_block_n*BN);
+            asm volatile("bar.sync 10, 256;\n");
+            if (threadIdx.x == 128) {
+                // Blank I - enable the output TMA store:
+                // Fill in 1 so one consumer thread stores the assembled
+                // BM-by-BN shared C tile to global C^T. The coordinates are
+                // passed as (M offset, N offset) because C is stored transposed.
+                store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
                 asm volatile("cp.async.bulk.commit_group;");
             }
         }
     }
 }
 
-// Rotate/flip quadrant appropriately
-void rot(int n, int& x, int& y, int rx, int ry) {
-    if (ry == 0) {
-        if (rx == 1) {
-            x = n-1 - x;
-            y = n-1 - y;
-        }
-        // Swap x and y
-        int t = x;
-        x = y;
-        y = t;
-    }
-}
-
-// Convert distance along curve to (x,y) point
-void d2xy(int n, int d, int& x, int& y) {
-    int rx, ry, s, t = d;
-    x = y = 0;
-    for (s = 1; s < n; s *= 2) {
-        rx = 1 & (t/2);
-        ry = 1 & (t ^ rx);
-        rot(s, x, y, rx, ry);
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-    }
-}
-
-void createHilbert(int M, int N, int CORES, int *space) {
-    int dim = (1 << (32 - __builtin_clz(max(M, N) - 1)));
-    int core = 0, loc = 0;
-    std::vector<std::string> v(dim, std::string(dim, '.'));
-    memset(space, -1, sizeof(int)*CORES*SPACE_LEN);
-    int FCORES = 64;
-    int total = 0;
-    std::vector<std::vector<int>> pos(CORES, std::vector<int>());
-    for (int i = 0; i < dim*dim; ++i) {
-        int x, y;
-        d2xy(dim, i, x, y);
-        if (x < M && y < N) {
-            assert(loc < SPACE_LEN);
-            assert(v[x][y] == '.');
-            v[x][y] = '*';
-            ++total;
-            pos[core].push_back((x << 16) | y);
-            ++core;
-            if (core == FCORES) {core = 0;}
-        }
-    }
-    core = FCORES;
-    for (int i = 0; i < FCORES; ++i) {
-        if (pos.back().size() >= pos[0].size()-1) break;
-        pos[core].push_back(pos[i].back());
-        pos[i].pop_back();
-        ++core;
-        if (core == CORES) {core = FCORES;}
-    }
-    for (int i = 0; i < CORES; ++i) {
-        for (int j = 0; j < pos[i].size(); ++j) {
-            space[i*SPACE_LEN + j] = pos[i][j];
-        }
-    }
-    assert(total == M*N);
-}
-
-void runKernel12(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int BM = 128;
     constexpr int BN = 256;
     constexpr int BK = 64;
     constexpr int NUM_THREADS = 128*3;
     constexpr int QSIZE = 3;
+    // Blank J - cluster extent along M:
+    // Use 2 so each cluster contains two CTAs computing adjacent BM row tiles.
+    // CLUSTER_N remains 1, making B multicast useful across the two M ranks.
     constexpr int CLUSTER_M = 2;
     constexpr int CLUSTER_N = 1;
     constexpr int NUM_SM = 128;
-    constexpr int NUM_CONSUMERS = (NUM_THREADS / 128) - 1;
     static_assert(NUM_SM % (CLUSTER_M*CLUSTER_N) == 0);
 
     if (_prev_m != M) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-        d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false, true>(C, N, M);
+        // Blank K - output-map swizzle:
+        // Fill in false (0). Shared C is arranged as a normal column-major
+        // BM-by-BN tile for TMA storage, not the 128-byte-swizzled WGMMA input
+        // layout used by A and B.
+        d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
-        int *space;
-        space = (int*)malloc(sizeof(int)*NUM_SM*SPACE_LEN);
-        createHilbert(ceil_div(M, BM*CLUSTER_M), ceil_div(N, BN*CLUSTER_N), NUM_SM/CLUSTER_M/CLUSTER_N, space);
-        cudaCheck(cudaMalloc((void **)&_dspace, sizeof(int)*NUM_SM*SPACE_LEN));
-        cudaCheck(cudaMemcpy(_dspace, space, sizeof(int)*NUM_SM*SPACE_LEN, cudaMemcpyHostToDevice));
     }
     // Assert cached values are of same size
     assert (M == _prev_m && N == _prev_n && K == _prev_k);
-    auto* kernel = matmulKernel12<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M, CLUSTER_N>;
+    auto* kernel = matmulKernel10<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M, CLUSTER_N>;
     constexpr size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
     static_assert(sMemSize < 256 * 1024);
     cudaCheck(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, d_tma_map_C, d_tma_map_A, d_tma_map_B, _dspace);
+    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, d_tma_map_C, d_tma_map_A, d_tma_map_B);
 }
-    
-} // namespace M12
 
-using M12::runKernel12;
+} // namespace M10
 
-void sgemm_fastcu_handwritten_tma_wgmma_bf16(
+using M10::runKernel10;
+
+void sgemm_fastcu_tma_store_bf16(
     const torch::Tensor &matrix_a,
     const torch::Tensor &matrix_b_transposed,
     torch::Tensor &output_matrix_transposed)
@@ -668,33 +707,31 @@ void sgemm_fastcu_handwritten_tma_wgmma_bf16(
     TORCH_CHECK(matrix_a.device().is_cuda(), "Matrix A must be on CUDA device");
     TORCH_CHECK(matrix_b_transposed.device().is_cuda(), "Matrix B^T must be on CUDA device");
     TORCH_CHECK(output_matrix_transposed.device().is_cuda(), "Output C^T must be on CUDA device");
-
     TORCH_CHECK(matrix_a.scalar_type() == at::kBFloat16, "Matrix A must be bfloat16");
     TORCH_CHECK(matrix_b_transposed.scalar_type() == at::kBFloat16, "Matrix B^T must be bfloat16");
     TORCH_CHECK(output_matrix_transposed.scalar_type() == at::kBFloat16, "Output C^T must be bfloat16");
-
     TORCH_CHECK(matrix_a.dim() == 2 && matrix_b_transposed.dim() == 2, "A and B^T must be 2D tensors");
-    TORCH_CHECK(matrix_a.is_contiguous() && matrix_b_transposed.is_contiguous(),
-                "A and B^T must be contiguous");
+    TORCH_CHECK(matrix_a.is_contiguous() && matrix_b_transposed.is_contiguous(), "A and B^T must be contiguous");
     TORCH_CHECK(output_matrix_transposed.is_contiguous(), "Output C^T must be contiguous");
 
     const int M = static_cast<int>(matrix_a.size(0));
     const int K = static_cast<int>(matrix_a.size(1));
     const int N = static_cast<int>(matrix_b_transposed.size(0));
-
+    TORCH_CHECK(M % 2048 == 0 && N % 2048 == 0 && K % 64 == 0, "Day 17 matmul_10 requires M,N multiples of 2048 and K multiple of 64");
     TORCH_CHECK(matrix_b_transposed.size(1) == K, "B^T must have shape N x K");
     TORCH_CHECK(output_matrix_transposed.size(0) == N && output_matrix_transposed.size(1) == M,
                 "Output C^T must have shape N x M");
 
+    // Blank L - completion gate:
+    // Leave this zero until every earlier blank is complete. Fill in 1 to run
+    // matmul_10 instead of returning a safe zero output.
+    if (!1) {
+        output_matrix_transposed.zero_();
+        return;
+    }
+
     auto *d_A = reinterpret_cast<bf16 *>(matrix_a.data_ptr<at::BFloat16>());
     auto *d_Bt = reinterpret_cast<bf16 *>(matrix_b_transposed.data_ptr<at::BFloat16>());
     auto *d_Ct = reinterpret_cast<bf16 *>(output_matrix_transposed.data_ptr<at::BFloat16>());
-
-    // The upstream benchmark reuses the same A/B/C allocations for all timed
-    // iterations, so its tensor-map cache keys only on shape. The puzzle runner
-    // allocates a fresh output tensor per call; force tensor-map recreation so
-    // the TMA store points at the current output buffer.
-    M12::_prev_m = 0;
-    runKernel12(M, N, K, d_A, d_Bt, d_Ct, nullptr);
+    M10::runKernel10(M, N, K, d_A, d_Bt, d_Ct, nullptr);
 }
-    
