@@ -23,3 +23,23 @@ Use this as your checklist. Each item corresponds to a `GEMM_TODO_*` placeholder
 | `17_kernel_fastcu_matmul10_tma_store.cu` | fast.cu matmul_10: accumulator conversion, stmatrix staging, and TMA store. |
 | `18_kernel_fastcu_matmul12_final.cu` | fast.cu matmul_12: final combined handwritten kernel and benchmark analysis. |
 | `19_kernel_cutlass3_hopper_tunable.cu` | CUTLASS 3 Hopper: tune TMA warp-specialized schedule, stage count, tile/cluster shape, raster order, decomposition, swizzle, and split count. |
+
+## CuTe GEMM tutorials
+
+These blanks are C++ `GEMM_TODO_*` values inside the complete flat
+`cuda/20_*.cu` through `cuda/28_*.cu` implementations, with completed mirrors
+under `solutions/cuda/`. Run
+`python3 python/benchmark_advanced_day.py --day DAY --source challenge
+--cutlass-dir .cache/cutlass-v4.6.1 --dry-run` to check them.
+
+| Day | Blanks | What the blanks teach |
+| --- | --- | --- |
+| 20 | CTA M/N/K and copy/compute ThreadLayouts | How `local_tile` and `local_partition` distribute tensors across CTAs and threads. |
+| 21 | CTA tile, TiledCopy thread layout, TiledMMA replication | How CuTe packages copy and compute instructions with logical partitions. |
+| 22 | CTA K, SMEM stages, cp.async partition, MMA replication | How GMEM-to-SMEM, SMEM-to-register, and Tensor Core work overlap. |
+| 23 | WGMMA K tile, stages, copy layout, wait depth | How a 128-thread warpgroup consumes SMEM descriptors asynchronously. |
+| 24 | TMA coordinate, CTA tile, TMA stage count | How one elected lane and transaction barriers drive a circular TMA/WGMMA pipeline. |
+| 25 | UMMA M/N, K depth, copy width, cluster | How Blackwell moves accumulators into TMEM and returns them to registers. |
+| 26 | UMMA M/N, K depth, TMA coordinate, cluster | How TMA replaces cooperative copies while UMMA/TMEM remains unchanged. |
+| 27 | 2-SM UMMA tile, K depth, cluster M/N | How peer CTAs construct multicast masks and share one UMMA operation. |
+| 28 | 2-SM UMMA tile, K depth, epilogue subdivision, cluster | How tiled C-load and D-store TMA operations optimize the Blackwell epilogue. |

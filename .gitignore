@@ -31,3 +31,4 @@ _executed.ipynb
 
 # Benchmark outputs
 gemm-hard-way-challenge/result/
+gemm-hard-way-challenge/.cache/

@@ -1,10 +1,13 @@
 # GEMM the Hard Way Standalone Challenge
 
-This folder is a standalone exercise path for learning GEMM implementation in three chapters:
+This folder is a standalone exercise path for learning GEMM and fused GPU
+kernels in four chapters:
 
 1. Days 1-12 build a CUDA GEMM from naive FP32 through asynchronous Tensor Cores.
 2. Days 13-18 form Chapter 2: handwritten Hopper optimization without CUTLASS, based on fast.cu-style TMA/WGMMA kernels. https://www.aleksagordic.com/blog/matmul
 3. Day 19 forms Chapter 3: CUTLASS 3.x Hopper configuration and tuning, following https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way-2/
+4. Days 20-28 form Chapter 4: low-level CuTe GEMM tutorials, progressing from
+   layouts and tiled operations to Hopper WGMMA/TMA and Blackwell UMMA/TMEM.
 
 References:
 
@@ -15,7 +18,11 @@ References:
 - CUTLASS official SM90 kernel headers: https://github.com/NVIDIA/cutlass/tree/main/include/cutlass/gemm/kernel
 - Hopper fast.cu-style blog notes: BF16 H100 matmul path with WGMMA, TMA, persistent scheduling, clusters, and L2-aware scheduling.
 
-Each CUDA file from `01` through `19` is included under `cuda/`. Days 1-12 cover CUDA through Tensor Core async pipelining, Days 13-18 are handwritten Hopper optimization exercises, and Day 19 expresses the Hopper path through CUTLASS 3.
+CUDA files `01` through `28` live under `cuda/`. Days 20-28 are flat, complete
+C++ sources from NVIDIA's `examples/cute/tutorial` tree. The source-level
+blanks sit directly in CuTe layouts, tilers, copy atoms, MMA atoms, pipelines,
+clusters, and epilogues. Python is orchestration only: it compiles the selected
+local `.cu` file with NVCC and never imports an example or kernel.
 
 ## Day map
 
@@ -64,6 +71,33 @@ decomposition tuning.
 | --- | --- |
 | `cuda/19_kernel_cutlass3_hopper_tunable.cu` | CUTLASS 3 SM90 kernel with blanks for schedule, stages, tile/cluster shape, raster order, decomposition, swizzle, and splits. |
 
+### Days 20-28: Chapter 4 - CuTe GEMM from layouts to Blackwell
+
+These lessons use CUTLASS v4.6.1 at commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3`. They follow NVIDIA's
+[`examples/cute/tutorial`](https://github.com/NVIDIA/cutlass/tree/main/examples/cute/tutorial)
+and the [CuTe GEMM tutorial](https://docs.nvidia.com/cutlass/4.2.1/media/docs/cpp/cute/0x_gemm_tutorial.html).
+Each lesson contains the complete tutorial `.cu`; the pinned checkout supplies
+CuTe/CUTLASS headers and `example_utils.hpp`. The runner compiles the selected
+local challenge or solution directly. Hopper-only lessons require SM90 and
+Blackwell lessons require SM100.
+
+| Day | Official example | Main concepts |
+| --- | --- | --- |
+| 20 | `cute/tutorial/sgemm_1.cu` | Tensor shapes/strides, `local_tile`, `local_partition`, and scalar CuTe `gemm`. |
+| 21 | `cute/tutorial/sgemm_2.cu` | `Copy_Atom`, `TiledCopy`, `MMA_Atom`, and `TiledMMA` partitioning. |
+| 22 | `cute/tutorial/sgemm_sm80.cu` | Tensor Core MMA, swizzled SMEM, and multistage `cp.async`. |
+| 23 | `cute/tutorial/hopper/wgmma_sm90.cu` | Descriptor-sourced WGMMA and warpgroup synchronization. |
+| 24 | `cute/tutorial/hopper/wgmma_tma_sm90.cu` | TMA partitioning and mbarrier producer/consumer pipelines. |
+| 25 | `cute/tutorial/blackwell/01_mma_sm100.cu` | 1-SM UMMA, TMEM allocation, and TMEM-to-register copies. |
+| 26 | `cute/tutorial/blackwell/02_mma_tma_sm100.cu` | 1-SM UMMA with TMA mainloop loads. |
+| 27 | `cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu` | Peer-CTA 2-SM UMMA and multicast TMA. |
+| 28 | `cute/tutorial/blackwell/05_mma_tma_epi_sm100.cu` | 2-SM multicast mainloop plus tiled TMA load/store epilogue. |
+
+Each challenge `.cu` file explains the algorithm and asks you to fill real
+compile-time aliases in the complete implementation. Its matching
+`solutions/cuda/` file is fully filled and directly compilable.
+
 ## Layout
 
 | Path | Purpose |
@@ -72,6 +106,11 @@ decomposition tuning.
 | `BLANKS.md` | Greppable TODO list grouped by file. |
 | `solutions/cuda/` | Complete solution kernels copied/adapted from the upstream implementation and later Hopper exercises. |
 | `solutions/python/benchmark_solution.py` | Correctness and benchmark runner for the complete solutions. |
+| `cuda/20_*.cu` ... `cuda/28_*.cu` | Complete flat C++ implementations with source-level challenge blanks and explanations. |
+| `solutions/cuda/20_*.cu` ... `solutions/cuda/28_*.cu` | Completed full-source advanced C++ lessons. |
+| `python/benchmark_advanced_day.py` | Direct NVCC build, architecture, correctness, and benchmark runner for Days 20-28. |
+| `scripts/setup_advanced_cutlass.sh` | Fetch and verify the pinned official CUTLASS v4.6.1 checkout. |
+| `scripts/upload_run_advanced_day.sh` | Upload one advanced lesson and its official source dependencies to a GPU pod. |
 | `scripts/upload_to_pod.sh` | Upload this standalone challenge to the configured Kubernetes pod. |
 | `scripts/run_remote_day.sh` | Run correctness + benchmark for one or more days on the pod. |
 | `scripts/run_remote_matrix.sh` | Convenience wrapper that uploads, then runs selected days. |
@@ -113,10 +152,38 @@ scripts/run_remote_matrix.sh --day 14 --with-cutlass
 scripts/upload_run_one_day.sh --day 15 --with-cutlass
 scripts/upload_run_one_day.sh --day 18 --with-cutlass --sizes "1024 2048 4096"
 scripts/upload_run_one_day.sh --day 19 --with-cutlass --sizes "1024 2048 4096"
+scripts/upload_run_advanced_day.sh --day 20 --solution
+scripts/upload_run_advanced_day.sh --day 23 --solution
+scripts/upload_run_advanced_day.sh --day 24 --solution
+scripts/upload_run_advanced_day.sh --day 25 --solution --pod "$B200_POD"
+scripts/upload_run_advanced_day.sh --day 28 --solution --pod "$B200_POD"
 scripts/run_remote_matrix.sh --all --skip-upload
 ```
+
+For a challenge, omit `--solution`. The runner will list every remaining
+`GEMM_TODO` blank before invoking NVCC. `--dry-run` validates a completed
+source and prints the selected local source and helper directory.
+Day 20 checks its full output against a pedantic-FP32 cuBLAS reference before
+starting the timing loop and exits with an error on any mismatch.
+
+### Code navigation for Days 20-28
+
+Generate a compilation database containing the real NVCC architecture and
+include flags for every challenge and solution:
+
+```bash
+scripts/setup_code_navigation.sh
+```
+
+When this repository is opened at its root, the local VS Code C/C++ settings
+read `build/gemm-hard-way-navigation/compile_commands.json`. This enables
+go-to-definition and symbol completion for CuTe and CUTLASS headers. Rerun the
+script only when a lesson is added, renamed, or its compiler flags change.
 
 ## Attribution
 
 The original explore-gemm implementation is licensed under Apache License 2.0; a copy is included as `LICENSE.upstream`.
 Days 13-18 include code or exercises adapted from the MIT-licensed fast.cu repository; the license is included as `LICENSE.fastcu`.
+Days 20-28 contain NVIDIA CuTe tutorial sources under CUTLASS's BSD-3-Clause
+license; their license headers are preserved. Adjacent helper headers remain
+in the pinned official checkout created by the setup script.

@@ -6,11 +6,32 @@ Current dev pod, subject to change:
 
 ```bash
 export GEMM_NS=kk-flyte-adhoc
-export GEMM_POD=a5fwvrxdqp6kcb4xfj5d-n0-0
+export GEMM_POD=fdad68bdd688348ee809-n0-0
 export GEMM_REMOTE_DIR=/tmp/gemm-hard-way-challenge
 ```
 
 If the pod changes, update only `GEMM_POD` and `GEMM_NS`.
+
+For the CuTe tutorial chapter:
+
+```bash
+# Generic/Ampere-compatible and SM90 Hopper lessons on the provided H100 pod:
+scripts/upload_run_advanced_day.sh --day 20 --solution
+scripts/upload_run_advanced_day.sh --day 22 --solution
+scripts/upload_run_advanced_day.sh --day 23 --solution
+scripts/upload_run_advanced_day.sh --day 24 --solution
+
+# SM100 Blackwell lessons require a separate B200/SM100 pod:
+scripts/upload_run_advanced_day.sh --day 25 --solution --pod "$B200_POD"
+scripts/upload_run_advanced_day.sh --day 28 --solution --pod "$B200_POD"
+```
+
+The first tutorial run verifies the approved, pinned NVIDIA CUTLASS v4.6.1
+checkout, then uploads its CuTe headers and tutorial helper sources. The
+selected local challenge or solution `.cu` is compiled directly with NVCC and
+cached by source hash. No plugin, internet script, or CuTe DSL package is
+installed or executed. Pass `--dry-run` to check blanks and source selection
+without compiling.
 
 ## 1. Check pod and GPU access
 
