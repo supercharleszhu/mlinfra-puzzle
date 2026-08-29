@@ -85,6 +85,5 @@ endif()
 # -----------------------------------------------------------------------------
 
 add_subdirectory(blog)
-add_subdirectory(puzzle)
 
-message(STATUS "cutlass-puzzle: configured. Build with  cmake --build build  then run any target.")
+message(STATUS "cutlass-puzzle: configured. Build with cmake --build build --target blog_all.")
