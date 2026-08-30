@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 
 # -----------------------------------------------------------------------------
-# cutlass-puzzle: learn CUTLASS and CuTe by filling in TODOs.
+# mlinfra-puzzle: hands-on machine-learning infrastructure exercises.
 # -----------------------------------------------------------------------------
 
-project(cutlass_puzzle LANGUAGES CXX CUDA)
+project(mlinfra_puzzle LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ if (NOT DEFINED CUTLASS_PUZZLE_CUDA_ARCHS)
     set(CUTLASS_PUZZLE_CUDA_ARCHS "80")
   endif()
 endif()
-message(STATUS "cutlass-puzzle: targeting CUDA archs = ${CUTLASS_PUZZLE_CUDA_ARCHS}")
+message(STATUS "mlinfra-puzzle: targeting CUDA archs = ${CUTLASS_PUZZLE_CUDA_ARCHS}")
 
 # -----------------------------------------------------------------------------
 # CUTLASS discovery
@@ -42,6 +42,8 @@ message(STATUS "cutlass-puzzle: targeting CUDA archs = ${CUTLASS_PUZZLE_CUDA_ARC
 if (NOT DEFINED CUTLASS_DIR)
   if (DEFINED ENV{CUTLASS_DIR})
     set(CUTLASS_DIR "$ENV{CUTLASS_DIR}")
+  elseif (EXISTS "${CMAKE_SOURCE_DIR}/cutlass-puzzle/.cache/cutlass-v4.6.1/include/cutlass/cutlass.h")
+    set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/cutlass-puzzle/.cache/cutlass-v4.6.1")
   elseif (EXISTS "${CMAKE_SOURCE_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
     set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass")
   endif()
@@ -55,7 +57,7 @@ if (NOT CUTLASS_DIR OR NOT EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
     "  Option C: export CUTLASS_DIR=/path/to/cutlass before invoking cmake.\n"
     "  Currently resolved CUTLASS_DIR='${CUTLASS_DIR}'")
 endif()
-message(STATUS "cutlass-puzzle: using CUTLASS at ${CUTLASS_DIR}")
+message(STATUS "mlinfra-puzzle: using CUTLASS at ${CUTLASS_DIR}")
 
 # -----------------------------------------------------------------------------
 # Common interface target
@@ -86,4 +88,4 @@ endif()
 
 add_subdirectory(blog)
 
-message(STATUS "cutlass-puzzle: configured. Build with cmake --build build --target blog_all.")
+message(STATUS "mlinfra-puzzle: configured. Build with cmake --build build --target blog_all.")

@@ -30,5 +30,5 @@ __pycache__/
 _executed.ipynb
 
 # Benchmark outputs
-gemm/result/
-gemm/.cache/
+cutlass-puzzle/result/
+cutlass-puzzle/.cache/

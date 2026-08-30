@@ -29,7 +29,7 @@ These compile against the top-level CMake project in this repository — see the
 [README](../README.md) for setup.
 
 ```bash
-cd /path/to/cutlass-puzzle
+cd /path/to/mlinfra-puzzle
 cmake -B build -GNinja
 cmake --build build --target blog_01_tiled_copy
 ./build/blog/blog_01_tiled_copy
