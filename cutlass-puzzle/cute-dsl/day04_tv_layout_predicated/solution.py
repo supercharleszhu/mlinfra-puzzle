@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""
-Day 04 — CuTe DSL TV-layout elementwise add with OOB predication (solution).
+"""Day 04: TV-layout elementwise add with OOB predication.
 
 Builds on Day 03 by:
 
@@ -17,6 +16,13 @@ import argparse
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+
+try:
+    import cutlass.testing as testing
+except ModuleNotFoundError as error:
+    if error.name != "cutlass.testing":
+        raise
+    from cutlass.cute import testing
 
 
 @cute.kernel
@@ -110,7 +116,27 @@ def elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     )
 
 
-def run(M: int, N: int) -> None:
+def benchmark(
+    compiled,
+    a_: cute.Tensor,
+    b_: cute.Tensor,
+    c_: cute.Tensor,
+    total_bytes: int,
+    warmup: int,
+    iterations: int,
+) -> tuple[float, float]:
+    """Return average kernel time in microseconds and effective GB/s."""
+    avg_time_us = testing.benchmark(
+        compiled,
+        kernel_arguments=testing.JitArguments(a_, b_, c_),
+        warmup_iterations=warmup,
+        iterations=iterations,
+    )
+    bandwidth_gbps = total_bytes / (avg_time_us * 1_000)
+    return avg_time_us, bandwidth_gbps
+
+
+def run(M: int, N: int, run_benchmark: bool, warmup: int, iterations: int) -> None:
     import torch
 
     if not torch.cuda.is_available():
@@ -126,18 +152,31 @@ def run(M: int, N: int) -> None:
     c_ = from_dlpack(c, assumed_align=16).mark_layout_dynamic()
 
     print(f"\n=== TV-layout elementwise add (M={M}, N={N}) ===")
-    elementwise_add(a_, b_, c_)
+    compiled = cute.compile(elementwise_add, a_, b_, c_)
+    compiled(a_, b_, c_)
     torch.cuda.synchronize()
     torch.testing.assert_close(c, a + b)
     print("  OK")
+
+    if run_benchmark:
+        # Two FP16 reads plus one FP16 write: 6 bytes per output element.
+        total_bytes = 3 * a.numel() * a.element_size()
+        avg_time_us, bandwidth_gbps = benchmark(
+            compiled, a_, b_, c_, total_bytes, warmup, iterations
+        )
+        print(f"  time={avg_time_us:.3f} us")
+        print(f"  effective bandwidth={bandwidth_gbps:.2f} GB/s")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--M", type=int, default=1024)
     p.add_argument("--N", type=int, default=1024)
+    p.add_argument("--benchmark", action="store_true")
+    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--iterations", type=int, default=100)
     args = p.parse_args()
     # Deliberately try non-tile-multiple sizes — the predicate handles them.
-    run(args.M, args.N)
-    run(1023, 1025)   # odd primes-ish, hits the predicate path
+    run(args.M, args.N, args.benchmark, args.warmup, args.iterations)
+    run(1023, 1025, False, args.warmup, args.iterations)
     print("\nSuccess.")

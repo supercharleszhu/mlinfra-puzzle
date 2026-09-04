@@ -1,6 +1,6 @@
 # mlinfra-puzzle
 
-Hands-on CUDA, CUTLASS, CuTe C++, and CuTe Python DSL exercises.
+Hands-on systems and language-model implementation exercises.
 
 ## Repository layout
 
@@ -12,6 +12,7 @@ mlinfra-puzzle/
 │   ├── python/               # Correctness and benchmark runners
 │   ├── scripts/              # Local and Kubernetes helpers
 │   └── cute-dsl/             # Independent CuTe DSL Days 01–08
+├── llm-from-scratch-puzzle/  # Six compact PyTorch chapters
 └── blog/                     # Full C++ tutorial references
 ```
 
@@ -19,6 +20,19 @@ The main curriculum is documented in
 [`cutlass-puzzle/README.md`](cutlass-puzzle/README.md).
 The Python DSL curriculum is documented in
 [`cutlass-puzzle/cute-dsl/README.md`](cutlass-puzzle/cute-dsl/README.md).
+
+## LLM from-scratch track
+
+[`llm-from-scratch-puzzle/`](llm-from-scratch-puzzle/README.md) contains six
+explanation-rich Jupyter notebooks with 20 original, CPU-friendly exercises on
+token windows, attention, GPT sizing, generation and checkpoints,
+classification, instruction formatting, and LoRA. It is a learning companion,
+not a reproduction of the book, and uses only synthetic toy inputs.
+
+```bash
+llm-from-scratch-puzzle/.venv/bin/python \
+  llm-from-scratch-puzzle/scripts/check_solutions.py
+```
 
 ## GEMM CUDA/CuTe C++ track
 

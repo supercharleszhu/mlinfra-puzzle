@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""
-Day 04 — CuTe DSL TV-layout elementwise add with OOB predication (puzzle).
+"""Day 04: TV-layout elementwise add with OOB predication.
 
-The host code is filled in for you. Implement the kernel: TV-layout
-partitioning + a predicate fragment built from a coordinate tensor.
+Official Notebook 08 develops elementwise add in four stages: scalar indexing,
+vectorized slices, TV-layout ownership, and a reusable elementwise operator.
+Day 03 covered the first two. This puzzle focuses on the TV-layout stage and
+adds coordinate-based predication for partial edge tiles.
 """
 import argparse
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+
+try:
+    import cutlass.testing as testing
+except ModuleNotFoundError as error:
+    if error.name != "cutlass.testing":
+        raise
+    from cutlass.cute import testing
 
 
 @cute.kernel
@@ -25,28 +33,39 @@ def elementwise_add_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
-    # TODO: implement the five steps below.
+    # TODO(1): Select this CTA's data and coordinate tiles.
     #
     # 1. Slice each of gA, gB, gC, cC down to this CTA's tile:
     #        blk_coord = ((None, None), bidx)
     #        blkA = gA[blk_coord]            etc.
+    # TODO(2): Compose each block with `tv_layout`.
     #
-    # 2. Compose each block with `tv_layout` so the result maps (tid, vid) -> addr:
+    # The mapping chain is:
+    #   (tid, vid) --tv_layout--> (tile_m, tile_n)
+    #              --blkA-------> global-memory address
+    #
+    # Compose each block so the result maps (tid, vid) -> address:
     #        tidfrgA   = cute.composition(blkA,   tv_layout)
     #        ...
     #        tidfrgCrd = cute.composition(blkCrd, tv_layout)
     #
-    # 3. Slice down to this thread's view: thr_coord = (tidx, None)
+    # TODO(3): Slice the composed tensors to this thread.
+    #
+    # Use thr_coord = (tidx, None):
     #        thrA   = tidfrgA[thr_coord]
     #        ...
     #        thrCrd = tidfrgCrd[thr_coord]
     #
-    # 4. Build the predicate fragment from thrCrd:
+    # TODO(4): Build a per-value predicate from the coordinate tensor:
     #        frgPred = cute.make_rmem_tensor(thrCrd.shape, cutlass.Boolean)
     #        for i in cutlass.range_constexpr(cute.size(frgPred)):
     #            frgPred[i] = cute.elem_less(thrCrd[i], shape)
     #
-    # 5. Load A and B into register fragments under the predicate, compute,
+    # TODO(5): Load A and B into register fragments, apply the elementwise
+    # operation, and store C under the predicate.
+    #
+    # The arithmetic is intentionally the easy part; ownership and bounds are
+    # the lesson. You can use:
     #    store C under the predicate. You can use:
     #        frgA = cute.make_fragment_like(thrA)
     #        if frgPred[i]: frgA[i] = thrA[i]    # DSL 4.5+ traces this dynamically
@@ -65,6 +84,7 @@ def elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
     val_layout = cute.make_ordered_layout((4, elts_per_vec), order=(1, 0))
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    print(f"[JIT] tiler_mn={tiler_mn} tv_layout={tv_layout}")
 
     gA = cute.zipped_divide(mA, tiler_mn)
     gB = cute.zipped_divide(mB, tiler_mn)
@@ -79,7 +99,27 @@ def elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     )
 
 
-def run(M: int, N: int) -> None:
+def benchmark(
+    compiled,
+    a_: cute.Tensor,
+    b_: cute.Tensor,
+    c_: cute.Tensor,
+    total_bytes: int,
+    warmup: int,
+    iterations: int,
+) -> tuple[float, float]:
+    """Return average kernel time in microseconds and effective GB/s."""
+    avg_time_us = testing.benchmark(
+        compiled,
+        kernel_arguments=testing.JitArguments(a_, b_, c_),
+        warmup_iterations=warmup,
+        iterations=iterations,
+    )
+    bandwidth_gbps = total_bytes / (avg_time_us * 1_000)
+    return avg_time_us, bandwidth_gbps
+
+
+def run(M: int, N: int, run_benchmark: bool, warmup: int, iterations: int) -> None:
     import torch
 
     if not torch.cuda.is_available():
@@ -95,17 +135,29 @@ def run(M: int, N: int) -> None:
     c_ = from_dlpack(c, assumed_align=16).mark_layout_dynamic()
 
     print(f"\n=== TV-layout elementwise add (M={M}, N={N}) ===")
-    elementwise_add(a_, b_, c_)
+    compiled = cute.compile(elementwise_add, a_, b_, c_)
+    compiled(a_, b_, c_)
     torch.cuda.synchronize()
     torch.testing.assert_close(c, a + b)
     print("  OK")
+
+    if run_benchmark:
+        total_bytes = 3 * a.numel() * a.element_size()
+        avg_time_us, bandwidth_gbps = benchmark(
+            compiled, a_, b_, c_, total_bytes, warmup, iterations
+        )
+        print(f"  time={avg_time_us:.3f} us")
+        print(f"  effective bandwidth={bandwidth_gbps:.2f} GB/s")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--M", type=int, default=1024)
     p.add_argument("--N", type=int, default=1024)
+    p.add_argument("--benchmark", action="store_true")
+    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--iterations", type=int, default=100)
     args = p.parse_args()
-    run(args.M, args.N)
-    run(1023, 1025)
+    run(args.M, args.N, args.benchmark, args.warmup, args.iterations)
+    run(1023, 1025, False, args.warmup, args.iterations)
     print("\nSuccess.")

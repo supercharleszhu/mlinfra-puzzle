@@ -18,7 +18,7 @@ After the relevant notebook, reinforce it with the local puzzle/solution:
 | 01 | `@cute.jit`, `@cute.kernel`, and thread IDs | Notebook 01 |
 | 02 | Layout algebra | Notebooks 04–06 |
 | 03 | Scalar and vectorized elementwise add | Notebooks 07–08 |
-| 04 | TV layouts and OOB predication | Notebooks 07–08 |
+| 04 | Notebook 08's TV-layout elementwise stage plus OOB predication | Notebooks 07–08 |
 | 05 | Producer/consumer async pipeline | Notebook 09 |
 | 06 | Benchmarking and configuration autotuning | Notebook 10 |
 | 07 | CUDA Graph capture and replay | Notebook 11 |
@@ -26,6 +26,13 @@ After the relevant notebook, reinforce it with the local puzzle/solution:
 
 Each `dayNN_*` directory contains `puzzle.py`, a completed `solution.py`, and
 a README. Every day also has a short, challenge-focused notebook.
+
+Day 03 implements Notebook 08's scalar and per-thread vector elementwise
+stages. Day 04 continues with CTA tiling and explicit `(thread, value)` layout
+ownership, then adds coordinate predication and compile-once bandwidth
+benchmarking. Read
+[`day04_tv_layout_predicated/README.md`](day04_tv_layout_predicated/README.md)
+for the full mapping and tiler derivation.
 
 Notebook 12 requires an SM100 Blackwell GPU. The configured H100 pod can run
 Steps 01–11, except for the TMEM section of Step 04.
