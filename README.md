@@ -12,6 +12,9 @@ mlinfra-puzzle/
 │   ├── python/               # Correctness and benchmark runners
 │   ├── scripts/              # Local and Kubernetes helpers
 │   └── cute-dsl/             # Independent CuTe DSL Days 01–08
+├── algorithm-coding-challenge/
+│   ├── grid-infection-puzzle/ # Multi-stage grid simulation interview mock
+│   └── memory-allocator-puzzle/ # O(log m) allocator interview mock
 ├── llm-from-scratch-puzzle/  # Six compact PyTorch chapters
 └── blog/                     # Full C++ tutorial references
 ```
@@ -32,6 +35,23 @@ not a reproduction of the book, and uses only synthetic toy inputs.
 ```bash
 llm-from-scratch-puzzle/.venv/bin/python \
   llm-from-scratch-puzzle/scripts/check_solutions.py
+```
+
+## Algorithm coding challenges
+
+[`algorithm-coding-challenge/grid-infection-puzzle/`](algorithm-coding-challenge/grid-infection-puzzle/README.md)
+is a staged simulation interview covering multi-source BFS, immune walls,
+recovery timing, threshold infection, death variants, candidate-written unit
+tests, and randomized differential testing.
+
+[`algorithm-coding-challenge/memory-allocator-puzzle/`](algorithm-coding-challenge/memory-allocator-puzzle/README.md)
+provides pointer-only and explicit-size allocator APIs, first-fit allocation,
+adjacent-block coalescing, bitmap oracles, and an expected `O(log m)`
+augmented-treap reference solution.
+
+```bash
+python3 algorithm-coding-challenge/grid-infection-puzzle/solution.py
+python3 algorithm-coding-challenge/memory-allocator-puzzle/solution.py
 ```
 
 ## GEMM CUDA/CuTe C++ track
