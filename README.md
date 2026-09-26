@@ -6,12 +6,14 @@ Hands-on systems and language-model implementation exercises.
 
 ```text
 mlinfra-puzzle/
-├── cutlass-puzzle/
-│   ├── cuda/                 # GEMM challenge Days 01–28
-│   ├── solutions/            # Completed CUDA/CuTe C++ implementations
+├── gpu-programming-puzzle/
+│   ├── cuda-cpp/
+│   │   ├── challenge/        # GEMM challenge Days 01–28
+│   │   ├── solutions/        # Completed CUDA/CuTe C++ implementations
+│   │   └── scripts/          # Local and Kubernetes helpers
 │   ├── python/               # Correctness and benchmark runners
-│   ├── scripts/              # Local and Kubernetes helpers
-│   └── cute-dsl/             # Independent CuTe DSL Days 01–08
+│   ├── cute-dsl/             # Independent CuTe DSL Days 01–11
+│   └── triton-puzzle/        # Triton tutorials and local challenges
 ├── algorithm-coding-challenge/
 │   ├── grid-infection-puzzle/ # Multi-stage grid simulation interview mock
 │   └── memory-allocator-puzzle/ # O(log m) allocator interview mock
@@ -20,9 +22,9 @@ mlinfra-puzzle/
 ```
 
 The main curriculum is documented in
-[`cutlass-puzzle/README.md`](cutlass-puzzle/README.md).
+[`gpu-programming-puzzle/README.md`](gpu-programming-puzzle/README.md).
 The Python DSL curriculum is documented in
-[`cutlass-puzzle/cute-dsl/README.md`](cutlass-puzzle/cute-dsl/README.md).
+[`gpu-programming-puzzle/cute-dsl/README.md`](gpu-programming-puzzle/cute-dsl/README.md).
 
 ## LLM from-scratch track
 
@@ -64,17 +66,17 @@ The 28-day GEMM path progresses through:
 4. Official NVIDIA CuTe tutorials through Hopper and Blackwell.
 
 ```bash
-cd cutlass-puzzle
+cd gpu-programming-puzzle
 python3 python/benchmark_advanced_day.py --day 20 --source solution --dry-run
-scripts/upload_run_advanced_day.sh --day 20 --solution
+cuda-cpp/scripts/upload_run_advanced_day.sh --day 20 --solution
 ```
 
 ## CuTe Python DSL track
 
 The DSL track begins with 12 official NVIDIA CUTLASS notebooks in
-`cutlass-puzzle/cute-dsl/notebooks/`, ordered from first launch through
+`gpu-programming-puzzle/cute-dsl/notebooks/`, ordered from first launch through
 Blackwell GEMM.
-Eight local challenges reinforce the core topics:
+Eleven local challenges reinforce the core topics:
 
 | Day | Topic |
 | --- | --- |
@@ -82,21 +84,36 @@ Eight local challenges reinforce the core topics:
 | 02 | Layout algebra |
 | 03 | Elementwise scalar and vectorized kernels |
 | 04 | TV layouts and predication |
-| 05 | Producer/consumer asynchronous pipelines |
-| 06 | Benchmarking and autotuning |
-| 07 | CUDA Graph capture and replay |
-| 08 | Tour to a complete SIMT GEMM |
+| 05 | Matrix transpose from naive mappings to padding and swizzling |
+| 06 | Nsight Compute analysis of transpose bottlenecks |
+| 07 | Producer/consumer asynchronous pipelines |
+| 08 | Benchmarking and autotuning |
+| 09 | CUDA Graph capture and replay |
+| 10 | Tour to a complete SIMT GEMM |
+| 11 | Stable softmax with local and warp reductions |
 
 ```bash
-python cutlass-puzzle/cute-dsl/day01_hello_world/solution.py
-python cutlass-puzzle/cute-dsl/day08_gemm_tour/solution.py
+python gpu-programming-puzzle/cute-dsl/day01_hello_world/solution.py
+python gpu-programming-puzzle/cute-dsl/day11_softmax_reduction/solution.py
 ```
 
-All eight days have shorter challenge notebooks. To prepare and verify the
+All eleven days have challenge notebooks. To prepare and verify the
 official Notebook 01 on the configured H100 pod:
 
 ```bash
-cutlass-puzzle/cute-dsl/scripts/setup_remote_notebook.sh --verify
+gpu-programming-puzzle/cute-dsl/scripts/setup_remote_notebook.sh --verify
+```
+
+## Triton track
+
+[`gpu-programming-puzzle/triton-puzzle/`](gpu-programming-puzzle/triton-puzzle/README.md)
+contains one local puzzle and solution for each numbered official Triton
+tutorial, followed by matrix-transpose and matched softmax-reduction
+challenges. Each day includes a generated notebook.
+
+```bash
+python gpu-programming-puzzle/triton-puzzle/scripts/generate_notebooks.py
+python gpu-programming-puzzle/triton-puzzle/scripts/check_curriculum.py
 ```
 
 ## Dependencies

@@ -1,0 +1,7 @@
+# Triton is normally supplied by the installed PyTorch CUDA wheel.
+numpy>=1.24
+matplotlib>=3.8,<4
+pandas>=2,<3
+jupyter>=1,<2
+nbconvert>=7,<8
+ipykernel>=6,<7

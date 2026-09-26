@@ -2,8 +2,8 @@ BSD 3-Clause License
 
 Copyright (c) 2026, Charles Zhu
 Copyright (c) 2023-2026, NVIDIA Corporation & Affiliates (for files under
-  blog/, cutlass-puzzle/cuda/, cutlass-puzzle/solutions/, and
-  cutlass-puzzle/cute-dsl/ that are derived
+  blog/, gpu-programming-puzzle/cuda-cpp/, and
+  gpu-programming-puzzle/cute-dsl/ that are derived
   from NVIDIA/cutlass)
 
 Redistribution and use in source and binary forms, with or without

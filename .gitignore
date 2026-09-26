@@ -30,5 +30,5 @@ __pycache__/
 _executed.ipynb
 
 # Benchmark outputs
-cutlass-puzzle/result/
-cutlass-puzzle/.cache/
+gpu-programming-puzzle/result/
+gpu-programming-puzzle/.cache/
