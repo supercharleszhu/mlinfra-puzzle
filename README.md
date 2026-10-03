@@ -17,8 +17,7 @@ mlinfra-puzzle/
 ├── algorithm-coding-challenge/
 │   ├── grid-infection-puzzle/ # Multi-stage grid simulation interview mock
 │   └── memory-allocator-puzzle/ # O(log m) allocator interview mock
-├── llm-from-scratch-puzzle/  # Six compact PyTorch chapters
-└── blog/                     # Full C++ tutorial references
+└── llm-from-scratch-puzzle/  # Six compact PyTorch chapters
 ```
 
 The main curriculum is documented in

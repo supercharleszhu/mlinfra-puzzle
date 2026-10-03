@@ -63,8 +63,8 @@ message(STATUS "mlinfra-puzzle: using CUTLASS at ${CUTLASS_DIR}")
 # Common interface target
 # -----------------------------------------------------------------------------
 #
-# All blog and puzzle executables link this. It captures the CUTLASS include
-# paths and the nvcc flags required to make CuTe-heavy code compile cleanly.
+# CUDA puzzle targets can link this interface to share CUTLASS include paths
+# and the nvcc flags required to make CuTe-heavy code compile cleanly.
 
 add_library(cutlass_puzzle_common INTERFACE)
 target_include_directories(cutlass_puzzle_common INTERFACE
@@ -86,6 +86,6 @@ endif()
 # Subdirectories
 # -----------------------------------------------------------------------------
 
-add_subdirectory(blog)
+add_subdirectory(gpu-programming-puzzle)
 
-message(STATUS "mlinfra-puzzle: configured. Build with cmake --build build --target blog_all.")
+message(STATUS "mlinfra-puzzle: configured GPU programming targets.")
