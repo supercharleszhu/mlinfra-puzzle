@@ -24,14 +24,16 @@ After the relevant notebook, reinforce it with the local puzzle/solution:
 | 07 | Producer/consumer async pipeline | Notebook 09 |
 | 08 | Benchmarking and configuration autotuning | Notebook 10 |
 | 09 | CUDA Graph capture and replay | Notebook 11 |
-| 10 | Tour to a complete H100-compatible SIMT GEMM | Notebook 12 |
+| 10 | GEMM tour: SIMT baseline to H100 TMA/WGMMA and B300 `tcgen05` | Notebook 12 |
 | 11 | Stable softmax with local and warp reductions | Notebook 07 |
+| 12 | One-pass softmax attention and simplified FlashAttention-2 | Days 10-11 |
 
-Each `dayNN_*` directory contains `puzzle.py`, a completed `solution.py`, and
-a README. Every day also has a challenge notebook. Days 04-11 are
+Days 01-11 contain `puzzle.py`, a completed `solution.py`, and a README.
+Day 12 is a completed algorithm walkthrough with a standalone solution.
+Every day also has a notebook. Days 04-12 are
 explanation-rich walkthroughs that bring the corresponding official notebook's
 concept progression, API rationale, executable experiments, debugging advice,
-and puzzle scaffold into one place.
+and implementation scaffold into one place.
 
 The previously completed GEMM-tour notebook is preserved at
 [`completed/day08_gemm_tour.ipynb`](completed/day08_gemm_tour.ipynb). The
@@ -44,17 +46,19 @@ benchmarking. Read
 [`day04_tv_layout_predicated/README.md`](day04_tv_layout_predicated/README.md)
 for the full mapping and tiler derivation.
 
-Days 05-11 continue that format for transpose dataflows and profiler-guided
+Days 05-12 continue that format for transpose dataflows and profiler-guided
 analysis, asynchronous pipeline state transitions, fair autotuning and
-benchmarking, CUDA Graph stream capture, a complete GEMM, and row-wise softmax
-reductions compared directly with Triton. Regenerate and check these notebooks
-with:
+benchmarking, CUDA Graph stream capture, a complete GEMM with FP16 H100 and
+B300 optimization paths, row-wise softmax reductions, and one-pass
+FlashAttention-2-style forward attention compared directly with Triton.
+Regenerate and check these notebooks with:
 
 ```bash
 python3 scripts/generate_day05_notebook.py
 python3 scripts/generate_day06_notebook.py
 python3 scripts/generate_day07_10_notebooks.py
 python3 scripts/generate_day11_notebook.py
+python3 scripts/generate_day12_notebook.py
 python3 scripts/check_curriculum_notebooks.py
 ```
 
@@ -73,6 +77,7 @@ pip install -r gpu-programming-puzzle/cute-dsl/requirements.txt
 
 python gpu-programming-puzzle/cute-dsl/day01_hello_world/solution.py
 python gpu-programming-puzzle/cute-dsl/day11_softmax_reduction/solution.py
+python gpu-programming-puzzle/cute-dsl/day12_softmax_attention/solution.py --benchmark
 jupyter notebook gpu-programming-puzzle/cute-dsl/notebooks/01_hello_world.ipynb
 ```
 

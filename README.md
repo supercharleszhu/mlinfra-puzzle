@@ -14,6 +14,8 @@ mlinfra-puzzle/
 │   ├── python/               # Correctness and benchmark runners
 │   ├── cute-dsl/             # Independent CuTe DSL Days 01–11
 │   └── triton-puzzle/        # Triton tutorials and local challenges
+├── autodiff-puzzle/          # Twenty hand-written Jacobian exercises
+├── tensor-puzzle/            # Twenty-one broadcasting/indexing puzzles
 ├── algorithm-coding-challenge/
 │   ├── grid-infection-puzzle/ # Multi-stage grid simulation interview mock
 │   └── memory-allocator-puzzle/ # O(log m) allocator interview mock
@@ -24,6 +26,24 @@ The main curriculum is documented in
 [`gpu-programming-puzzle/README.md`](gpu-programming-puzzle/README.md).
 The Python DSL curriculum is documented in
 [`gpu-programming-puzzle/cute-dsl/README.md`](gpu-programming-puzzle/cute-dsl/README.md).
+
+## Tensor and autodiff tracks
+
+[`tensor-puzzle/`](tensor-puzzle/README.md) contains 21 one-expression PyTorch
+exercises for broadcasting, masking, indexing, reductions, scatter updates,
+reshaping, interpolation, repetition, and bucketization. It is adapted from
+Sasha Rush's MIT-licensed Tensor Puzzles and uses a local deterministic checker
+instead of runtime downloads.
+
+[`autodiff-puzzle/`](autodiff-puzzle/README.md) contains 20 JAX exercises for
+deriving full Jacobians of scalar, vector, matrix, reduction, convolution, and
+indexing operations. It is adapted from Sasha Rush's MIT-licensed Autodiff
+Puzzles and also uses a local checker.
+
+```bash
+python3 tensor-puzzle/scripts/check_notebook.py
+python3 autodiff-puzzle/scripts/check_notebook.py
+```
 
 ## LLM from-scratch track
 
@@ -75,7 +95,7 @@ cuda-cpp/scripts/upload_run_advanced_day.sh --day 20 --solution
 The DSL track begins with 12 official NVIDIA CUTLASS notebooks in
 `gpu-programming-puzzle/cute-dsl/notebooks/`, ordered from first launch through
 Blackwell GEMM.
-Eleven local challenges reinforce the core topics:
+Twelve local lessons reinforce the core topics:
 
 | Day | Topic |
 | --- | --- |
@@ -88,15 +108,17 @@ Eleven local challenges reinforce the core topics:
 | 07 | Producer/consumer asynchronous pipelines |
 | 08 | Benchmarking and autotuning |
 | 09 | CUDA Graph capture and replay |
-| 10 | Tour to a complete SIMT GEMM |
+| 10 | GEMM tour from SIMT to H100 TMA/WGMMA and B300 `tcgen05` |
 | 11 | Stable softmax with local and warp reductions |
+| 12 | One-pass softmax attention and simplified FlashAttention-2 |
 
 ```bash
 python gpu-programming-puzzle/cute-dsl/day01_hello_world/solution.py
 python gpu-programming-puzzle/cute-dsl/day11_softmax_reduction/solution.py
+python gpu-programming-puzzle/cute-dsl/day12_softmax_attention/solution.py --benchmark
 ```
 
-All eleven days have challenge notebooks. To prepare and verify the
+All twelve days have notebooks. To prepare and verify the
 official Notebook 01 on the configured H100 pod:
 
 ```bash

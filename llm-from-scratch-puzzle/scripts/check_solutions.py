@@ -7,12 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHAPTERS = (
-    "chapter02_text_data",
-    "chapter03_attention",
-    "chapter04_gpt_architecture",
-    "chapter05_pretraining",
-    "chapter06_classification",
-    "chapter07_instruction_finetuning",
+    "chapter01_cs336_transformer_e2e",
+    "chapter02_classification",
+    "chapter03_instruction_finetuning",
 )
 
 

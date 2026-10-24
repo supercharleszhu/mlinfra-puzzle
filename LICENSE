@@ -5,6 +5,9 @@ Copyright (c) 2023-2026, NVIDIA Corporation & Affiliates (for files under
   gpu-programming-puzzle/cuda-cpp/ and gpu-programming-puzzle/cute-dsl/ that are derived
   from NVIDIA/cutlass)
 
+The adapted files under autodiff-puzzle/ and tensor-puzzle/ are licensed
+separately under the MIT licenses in their respective LICENSE files.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
 

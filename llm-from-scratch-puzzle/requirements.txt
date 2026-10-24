@@ -1,2 +1,4 @@
 torch>=2.2,<3
 jupyterlab>=4,<5
+numpy>=1.26,<3
+regex>=2024.0

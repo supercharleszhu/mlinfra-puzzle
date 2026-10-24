@@ -413,8 +413,43 @@ def day08_cells() -> list[dict[str, object]]:
             ranking; avoid including unrelated values that cause needless
             retuning.
 
-            Set `CUTE_DSL_LOG_AUTOTUNE=1` before execution when you need to see
-            candidate times and cache hits.
+            The first call for a new key benchmarks every candidate. Later
+            calls with the same key invoke the cached compiled winner:
+
+            ```python
+            add(a, b, c, 512, 512)   # tunes 64 versus 128 bits
+            add(a, b, c, 512, 512)   # cache hit; no benchmark
+            add(a, b, c, 1024, 512)  # new (m, n), so tune again
+            ```
+
+            This cache is process-local. Restarting the Python or Jupyter
+            kernel clears it. Calling `add_kernel(...).launch(...)` directly
+            also bypasses tuning because the decorator wraps `add`, not the
+            device kernel.
+
+            To print candidate timings, the winner, and cache hits, set the
+            environment variable before executing the decorated definition
+            (restart the Jupyter kernel first if the function already exists):
+
+            ```python
+            import os
+            os.environ["CUTE_DSL_LOG_AUTOTUNE"] = "1"
+            ```
+
+            After at least one call, the wrapper's internal cache shows the
+            selected configuration for each key:
+
+            ```python
+            print(add._best_config)
+            # {(512, 512): {"copy_bits": 128}}
+
+            print(add._best_config[(512, 512)])
+            # {"copy_bits": 128}
+            ```
+
+            `_best_config` is useful for debugging but is an internal API.
+            Use explicit `testing.tune` when application code needs the winning
+            dictionary as a supported return value.
             """
         ),
         markdown(
@@ -757,8 +792,823 @@ def day09_cells() -> list[dict[str, object]]:
     ]
 
 
+def day10_optimization_cells() -> list[dict[str, object]]:
+    return [
+        markdown(
+            """
+            ## Baseline: one thread computes one output
+
+            Start from the simplest correct mapping for
+            `C[M,K] = A[M,N] @ B[N,K]`. A 32x32 CTA contains 1024 threads,
+            and each thread computes one scalar output by reading the full
+            reduction dimension from global memory.
+
+            The baseline is intentionally inefficient. It gives the next two
+            optimizations a stable correctness and timing reference.
+            """
+        ),
+        code(
+            """
+            @cute.kernel
+            def baseline_matmul_kernel(A, B, C, M, N, K):
+                BLOCK_M: cutlass.Constexpr = 32
+                BLOCK_K: cutlass.Constexpr = 32
+
+                thread_idx, _, _ = cute.arch.thread_idx()
+                block_m, block_k, _ = cute.arch.block_idx()
+                local_m = thread_idx // BLOCK_K
+                local_k = thread_idx % BLOCK_K
+                row = block_m * BLOCK_M + local_m
+                col = block_k * BLOCK_K + local_k
+
+                if row < M and col < K:
+                    accum = cutlass.Float32(0.0)
+                    for n in cutlass.range(0, N):
+                        accum += (
+                            cutlass.Float32(A[row, n])
+                            * cutlass.Float32(B[n, col])
+                        )
+                    C[row, col] = accum
+
+
+            @cute.jit
+            def solve_baseline(
+                A: cute.Tensor,
+                B: cute.Tensor,
+                C: cute.Tensor,
+                M: cute.Int32,
+                N: cute.Int32,
+                K: cute.Int32,
+            ):
+                baseline_matmul_kernel(A, B, C, M, N, K).launch(
+                    grid=[cute.ceil_div(M, 32), cute.ceil_div(K, 32), 1],
+                    block=[1024, 1, 1],
+                )
+
+
+            def measure_tflops(launch, m, n, k, *, warmup=3, iterations=20):
+                for _ in range(warmup):
+                    launch()
+                torch.cuda.synchronize()
+
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(iterations):
+                    launch()
+                end.record()
+                torch.cuda.synchronize()
+
+                average_ms = start.elapsed_time(end) / iterations
+                tflops = (2.0 * m * n * k) / (average_ms / 1e3) / 1e12
+                return average_ms, tflops
+
+
+            M = N = K = 8192
+            torch.manual_seed(0)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            A = torch.randn((M, N), device="cuda", dtype=torch.float16)
+            B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+            C_baseline = torch.empty(
+                (M, K), device="cuda", dtype=torch.float32
+            )
+
+            A_cute = from_dlpack(A)
+            B_cute = from_dlpack(B)
+            C_baseline_cute = from_dlpack(C_baseline)
+            reference = A.float() @ B.float()
+
+            compiled_baseline = cute.compile(
+                solve_baseline,
+                A_cute,
+                B_cute,
+                C_baseline_cute,
+                M,
+                N,
+                K,
+            )
+
+
+            def launch_baseline():
+                compiled_baseline(
+                    A_cute, B_cute, C_baseline_cute, M, N, K
+                )
+
+
+            launch_baseline()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                C_baseline, reference, rtol=1e-2, atol=1e-2
+            )
+            baseline_ms, baseline_tflops = measure_tflops(
+                launch_baseline, M, N, K
+            )
+            print(
+                f"baseline: {baseline_ms:.4f} ms, "
+                f"{baseline_tflops:.2f} TFLOP/s"
+            )
+            """
+        ),
+        markdown(
+            """
+            ## Optimization 1: reuse CTA tiles through shared memory
+
+            The baseline reloads the same A and B values from global memory for
+            many output threads. This version stages one 32x32 A tile and one
+            32x32 B tile in shared memory for every reduction step.
+
+            Every CTA thread must execute both barriers:
+
+            1. after the cooperative stores, before any thread reads the tile;
+            2. after all reads, before any thread overwrites the tile.
+
+            Shared memory does not guarantee a speedup. On modern GPUs, the
+            hardware caches already capture some reuse, while this kernel adds
+            two CTA barriers after only 32 FMAs per thread.
+            """
+        ),
+        code(
+            """
+            import triton
+            from triton.runtime import driver
+
+            device = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(device)
+            triton_device = (
+                triton.runtime.driver.active.get_active_torch_device()
+            )
+            triton_props = driver.active.utils.get_device_properties(
+                triton_device.index
+            )
+
+            print("SM count:", props.multi_processor_count)
+            print("registers/SM:", triton_props["max_num_regs"])
+            print("threads/SM:", props.max_threads_per_multi_processor)
+            print("threads/block:", props.max_threads_per_block)
+            print("warp size:", props.warp_size)
+            print(
+                "maximum resident warps/SM:",
+                props.max_threads_per_multi_processor // props.warp_size,
+            )
+            print(
+                "opt-in shared memory/block:",
+                props.shared_memory_per_block_optin,
+                "bytes",
+            )
+            """
+        ),
+        code(
+            """
+            @cute.kernel
+            def shared_matmul_kernel(
+                A, B, C, sA_layout, sB_layout, M, N, K
+            ):
+                BLOCK_M: cutlass.Constexpr = 32
+                BLOCK_N: cutlass.Constexpr = 32
+                BLOCK_K: cutlass.Constexpr = 32
+
+                thread_idx, _, _ = cute.arch.thread_idx()
+                block_m, block_k, _ = cute.arch.block_idx()
+                local_m = thread_idx // BLOCK_K
+                local_k = thread_idx % BLOCK_K
+                row = block_m * BLOCK_M + local_m
+                col = block_k * BLOCK_K + local_k
+
+                smem = cutlass.utils.SmemAllocator()
+                sA = smem.allocate_tensor(A.element_type, sA_layout, 16)
+                sB = smem.allocate_tensor(B.element_type, sB_layout, 16)
+                accum = cutlass.Float32(0.0)
+
+                for n0 in cutlass.range(0, N, BLOCK_N):
+                    a_col = n0 + local_k
+                    b_row = n0 + local_m
+                    if row < M and a_col < N:
+                        sA[local_m, local_k] = A[row, a_col]
+                    else:
+                        sA[local_m, local_k] = cutlass.Float16(0.0)
+                    if b_row < N and col < K:
+                        sB[local_m, local_k] = B[b_row, col]
+                    else:
+                        sB[local_m, local_k] = cutlass.Float16(0.0)
+
+                    cute.arch.sync_threads()
+                    if row < M and col < K:
+                        for inner_n in cutlass.range_constexpr(32):
+                            accum += (
+                                cutlass.Float32(sA[local_m, inner_n])
+                                * cutlass.Float32(sB[inner_n, local_k])
+                            )
+                    cute.arch.sync_threads()
+
+                if row < M and col < K:
+                    C[row, col] = accum
+
+
+            @cute.jit
+            def solve_shared(
+                A: cute.Tensor,
+                B: cute.Tensor,
+                C: cute.Tensor,
+                M: cute.Int32,
+                N: cute.Int32,
+                K: cute.Int32,
+            ):
+                sA_layout = cute.make_layout(
+                    (32, 32), stride=(32, 1)
+                )
+                sB_layout = cute.make_layout(
+                    (32, 32), stride=(32, 1)
+                )
+                shared_matmul_kernel(
+                    A, B, C, sA_layout, sB_layout, M, N, K
+                ).launch(
+                    grid=[cute.ceil_div(M, 32), cute.ceil_div(K, 32), 1],
+                    block=[1024, 1, 1],
+                )
+
+
+            C_shared = torch.empty_like(C_baseline)
+            C_shared_cute = from_dlpack(C_shared)
+            compiled_shared = cute.compile(
+                solve_shared,
+                A_cute,
+                B_cute,
+                C_shared_cute,
+                M,
+                N,
+                K,
+            )
+
+
+            def launch_shared():
+                compiled_shared(A_cute, B_cute, C_shared_cute, M, N, K)
+
+
+            launch_shared()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                C_shared, reference, rtol=1e-2, atol=1e-2
+            )
+            shared_ms, shared_tflops = measure_tflops(
+                launch_shared, M, N, K
+            )
+            print(
+                f"shared: {shared_ms:.4f} ms, "
+                f"{shared_tflops:.2f} TFLOP/s"
+            )
+            """
+        ),
+        markdown(
+            """
+            ### Why shared memory can still be slower
+
+            Each CTA allocates two 32x32 FP16 tiles, or 4096 bytes total.
+            Shared-memory capacity therefore is not the occupancy limiter.
+            The 1024-thread CTA permits at most two resident CTAs on a GPU with
+            2048 threads per SM, and every reduction tile executes two
+            full-CTA barriers.
+
+            The important lesson is that shared memory is a mechanism for
+            controlled reuse, not an automatic optimization. Reuse must be
+            large enough to amortize synchronization and address-generation
+            overhead.
+            """
+        ),
+        markdown(
+            """
+            ## Optimization 2: CuTe thread-layout and register tiling
+
+            Follow the ownership model in
+            `cuda-cpp/solutions/20_cute_sgemm_1.cu`. A 256-thread CTA computes
+            a 128x128 output tile while traversing the reduction dimension in
+            depth-8 tiles.
+
+            CuTe layouts express two different ownership maps:
+
+            - `(32,8)` copy layouts partition the 128x8 A and B shared tiles;
+            - a `(16,16)` compute layout partitions the 128x128 C tile.
+
+            Projecting the compute layout onto A's row mode and B's output
+            mode gives every thread an 8x8 register accumulator. Each loaded A
+            value is reused across eight output columns, and each loaded B
+            value is reused across eight output rows.
+
+            ```text
+            CTA output tile:       128 x 128
+            reduction tile:          8
+            copy thread layout:     32 x 8
+            compute thread layout:  16 x 16
+            per-thread register:     8 x 8
+            threads per CTA:       256
+            ```
+            """
+        ),
+        markdown(
+            """
+            ### Partition copy and compute with CuTe layouts
+
+            This mirrors the C++ tutorial's `tA`, `tB`, and `tC` layouts:
+
+            ```python
+            copy_thread_layout = cute.make_layout(
+                (32, 8), stride=(8, 1)
+            )
+            compute_thread_layout = cute.make_layout(
+                (16, 16), stride=(1, 16)
+            )
+            ```
+
+            `cute.local_partition` applies these layouts directly:
+
+            - `tAgA` and `tAsA` partition matching global/shared A tiles;
+            - `tBgB` and `tBsB` partition matching transposed-B/shared tiles;
+            - projecting `compute_thread_layout` with `(1,None)` partitions A;
+            - projecting it with `(None,1)` partitions B;
+            - applying both modes partitions C and defines the accumulator
+              shape.
+
+            Like the referenced C++ tutorial, this first layout-tiled version
+            assumes M and K are multiples of 128 and N is a multiple of 8.
+            Predicated edge tiles are a separate transformation.
+            """
+        ),
+        code(
+            """
+            @cute.kernel
+            def warp_tiled_matmul_kernel(
+                A,
+                B,
+                C,
+                sA_layout,
+                sB_layout,
+                transposed_gB_layout,
+                copy_thread_layout,
+                compute_thread_layout,
+                M,
+                N,
+                K,
+            ):
+                BLOCK_M: cutlass.Constexpr = 128
+                BLOCK_N: cutlass.Constexpr = 8
+                BLOCK_K: cutlass.Constexpr = 128
+
+                thread_idx, _, _ = cute.arch.thread_idx()
+                block_m, block_k, _ = cute.arch.block_idx()
+
+                gC = cute.local_tile(
+                    C,
+                    (BLOCK_M, BLOCK_K),
+                    (block_m, block_k),
+                )
+                tCgC = cute.local_partition(
+                    gC, compute_thread_layout, thread_idx
+                )
+
+                smem = cutlass.utils.SmemAllocator()
+                sA = smem.allocate_tensor(
+                    A.element_type, sA_layout, 16
+                )
+                sB = smem.allocate_tensor(
+                    B.element_type, sB_layout, 16
+                )
+
+                tCsA = cute.local_partition(
+                    sA,
+                    compute_thread_layout,
+                    thread_idx,
+                    proj=(1, None),
+                )
+                tCsB = cute.local_partition(
+                    sB,
+                    compute_thread_layout,
+                    thread_idx,
+                    proj=(None, 1),
+                )
+                accum = cute.make_rmem_tensor(
+                    tCgC.shape, cutlass.Float32
+                )
+                accum.fill(0.0)
+
+                for n0 in cutlass.range(0, N, BLOCK_N):
+                    n_tile = n0 // BLOCK_N
+                    gA = cute.local_tile(
+                        A,
+                        (BLOCK_M, BLOCK_N),
+                        (block_m, n_tile),
+                    )
+                    gB = cute.local_tile(
+                        B,
+                        (BLOCK_N, BLOCK_K),
+                        (n_tile, block_k),
+                    )
+                    gB_transposed = cute.make_tensor(
+                        gB.iterator, transposed_gB_layout
+                    )
+
+                    tAgA = cute.local_partition(
+                        gA, copy_thread_layout, thread_idx
+                    )
+                    tAsA = cute.local_partition(
+                        sA, copy_thread_layout, thread_idx
+                    )
+                    tBgB = cute.local_partition(
+                        gB_transposed,
+                        copy_thread_layout,
+                        thread_idx,
+                    )
+                    tBsB = cute.local_partition(
+                        sB, copy_thread_layout, thread_idx
+                    )
+
+                    for value in cutlass.range_constexpr(
+                        cute.size(tAgA)
+                    ):
+                        tAsA[value] = tAgA[value]
+                    for value in cutlass.range_constexpr(
+                        cute.size(tBgB)
+                    ):
+                        tBsB[value] = tBgB[value]
+
+                    cute.arch.sync_threads()
+
+                    for inner_n in cutlass.range_constexpr(8):
+                        for i in cutlass.range_constexpr(8):
+                            a_value = cutlass.Float32(
+                                tCsA[i, inner_n]
+                            )
+                            for j in cutlass.range_constexpr(8):
+                                accum[i, j] += (
+                                    a_value
+                                    * cutlass.Float32(
+                                        tCsB[j, inner_n]
+                                    )
+                                )
+
+                    cute.arch.sync_threads()
+
+                for value in cutlass.range_constexpr(cute.size(tCgC)):
+                    tCgC[value] = accum[value]
+
+
+            @cute.jit
+            def solve_warp_tiled(
+                A: cute.Tensor,
+                B: cute.Tensor,
+                C: cute.Tensor,
+                M: cute.Int32,
+                N: cute.Int32,
+                K: cute.Int32,
+            ):
+                sA_layout = cute.make_layout(
+                    (128, 8), stride=(8, 1)
+                )
+                sB_layout = cute.make_layout(
+                    (128, 8), stride=(8, 1)
+                )
+                transposed_gB_layout = cute.make_layout(
+                    (128, 8), stride=(1, B.stride[0])
+                )
+                copy_thread_layout = cute.make_layout(
+                    (32, 8), stride=(8, 1)
+                )
+                compute_thread_layout = cute.make_layout(
+                    (16, 16), stride=(1, 16)
+                )
+
+                warp_tiled_matmul_kernel(
+                    A,
+                    B,
+                    C,
+                    sA_layout,
+                    sB_layout,
+                    transposed_gB_layout,
+                    copy_thread_layout,
+                    compute_thread_layout,
+                    M,
+                    N,
+                    K,
+                ).launch(
+                    grid=[
+                        cute.ceil_div(M, 128),
+                        cute.ceil_div(K, 128),
+                        1,
+                    ],
+                    block=[256, 1, 1],
+                )
+
+
+            C_warp_tiled = torch.empty_like(C_baseline)
+            C_warp_tiled_cute = from_dlpack(C_warp_tiled)
+            compiled_warp_tiled = cute.compile(
+                solve_warp_tiled,
+                A_cute,
+                B_cute,
+                C_warp_tiled_cute,
+                M,
+                N,
+                K,
+            )
+
+
+            def launch_warp_tiled():
+                compiled_warp_tiled(
+                    A_cute, B_cute, C_warp_tiled_cute, M, N, K
+                )
+
+
+            launch_warp_tiled()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                C_warp_tiled, reference, rtol=1e-2, atol=1e-2
+            )
+            warp_tiled_ms, warp_tiled_tflops = measure_tflops(
+                launch_warp_tiled, M, N, K
+            )
+            print(
+                f"warp tiled: {warp_tiled_ms:.4f} ms, "
+                f"{warp_tiled_tflops:.2f} TFLOP/s"
+            )
+            """
+        ),
+    ]
+
+
+def day10_tiled_mma_cells() -> list[dict[str, object]]:
+    return [
+        markdown(
+            """
+            ## 10. Optimization 3: package ownership with TiledCopy and TiledMma
+
+            The previous kernel exposed ownership with raw thread layouts.
+            This implementation follows
+            `cuda-cpp/challenge/21_cute_sgemm_2.cu` and packages the same
+            structure into two higher-level CuTe objects:
+
+            - `TiledCopy` combines a copy atom, thread layout, and value layout;
+            - `TiledMma` combines a universal FMA atom with its replicated
+              thread layout.
+
+            The CTA remains 128x128x8 with 256 threads. Each copy atom moves
+            four FP32 values, while the 16x16 MMA-atom layout partitions the
+            CTA output across all threads. The mainloop also demonstrates the
+            Day 21 register-prefetch sequence:
+
+            ```text
+            global -> prefetched register fragment
+                   -> shared-memory tile
+                   -> MMA register fragments
+                   -> FP32 accumulator
+            ```
+
+            `MmaUniversalOp(Float32)` uses FP32 A/B fragments, so this cell
+            builds column-major FP32 views matching the C++ SGEMM exercise.
+            The next section then defines the FP16 tensor-core contract.
+            """
+        ),
+        code(
+            """
+            @cute.kernel
+            def tiled_mma_sgemm_kernel(
+                mA,
+                mB,
+                mC,
+                sA_layout,
+                sB_layout,
+                tiled_copy_A,
+                tiled_copy_B,
+                tiled_mma,
+            ):
+                cta_tiler = (128, 128, 8)
+                tidx, _, _ = cute.arch.thread_idx()
+                bidx, bidy, _ = cute.arch.block_idx()
+
+                coord = (bidx, bidy, None)
+                gA = cute.local_tile(
+                    mA,
+                    tiler=cta_tiler,
+                    coord=coord,
+                    proj=(1, None, 1),
+                )
+                gB = cute.local_tile(
+                    mB,
+                    tiler=cta_tiler,
+                    coord=coord,
+                    proj=(None, 1, 1),
+                )
+                gC = cute.local_tile(
+                    mC,
+                    tiler=cta_tiler,
+                    coord=coord,
+                    proj=(1, 1, None),
+                )
+
+                smem = cutlass.utils.SmemAllocator()
+                sA = smem.allocate_tensor(
+                    mA.element_type, sA_layout, 16
+                )
+                sB = smem.allocate_tensor(
+                    mB.element_type, sB_layout, 16
+                )
+
+                thr_copy_A = tiled_copy_A.get_slice(tidx)
+                thr_copy_B = tiled_copy_B.get_slice(tidx)
+                tAgA = thr_copy_A.partition_S(gA)
+                tAsA = thr_copy_A.partition_D(sA)
+                tBgB = thr_copy_B.partition_S(gB)
+                tBsB = thr_copy_B.partition_D(sB)
+                tArA = cute.make_fragment_like(tAsA)
+                tBrB = cute.make_fragment_like(tBsB)
+
+                thr_mma = tiled_mma.get_slice(tidx)
+                tCsA = thr_mma.partition_A(sA)
+                tCsB = thr_mma.partition_B(sB)
+                tCgC = thr_mma.partition_C(gC)
+                tCrA = tiled_mma.make_fragment_A(tCsA)
+                tCrB = tiled_mma.make_fragment_B(tCsB)
+                tCrC = tiled_mma.make_fragment_C(tCgC)
+                tCrC.fill(0.0)
+
+                k_tile_count = cute.size(tAgA, mode=[3])
+                k_block_max = cute.size(tCrA, mode=[2])
+
+                cute.copy(
+                    tiled_copy_A,
+                    tAgA[None, None, None, 0],
+                    tArA,
+                )
+                cute.copy(
+                    tiled_copy_B,
+                    tBgB[None, None, None, 0],
+                    tBrB,
+                )
+
+                for k_tile in range(k_tile_count):
+                    cute.arch.sync_threads()
+                    cute.copy(tiled_copy_A, tArA, tAsA)
+                    cute.copy(tiled_copy_B, tBrB, tBsB)
+                    cute.arch.sync_threads()
+
+                    k_tile_next = (
+                        k_tile + 1
+                        if k_tile + 1 < k_tile_count
+                        else k_tile
+                    )
+                    cute.copy(
+                        tiled_copy_A,
+                        tAgA[None, None, None, k_tile_next],
+                        tArA,
+                    )
+                    cute.copy(
+                        tiled_copy_B,
+                        tBgB[None, None, None, k_tile_next],
+                        tBrB,
+                    )
+
+                    for k_block in cutlass.range_constexpr(
+                        k_block_max
+                    ):
+                        cute.autovec_copy(
+                            tCsA[None, None, k_block],
+                            tCrA[None, None, k_block],
+                        )
+                        cute.autovec_copy(
+                            tCsB[None, None, k_block],
+                            tCrB[None, None, k_block],
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            tCrC,
+                            tCrA[None, None, k_block],
+                            tCrB[None, None, k_block],
+                            tCrC,
+                        )
+
+                store_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), mC.element_type
+                )
+                cute.copy(store_atom, tCrC, tCgC)
+
+
+            @cute.jit
+            def solve_tiled_mma(
+                mA: cute.Tensor,
+                mB: cute.Tensor,
+                mC: cute.Tensor,
+            ):
+                sA_layout = cute.make_layout(
+                    (128, 8), stride=(1, 128)
+                )
+                sB_layout = cute.make_layout(
+                    (128, 8), stride=(1, 128)
+                )
+
+                copy_atom_A = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    mA.element_type,
+                    num_bits_per_copy=128,
+                )
+                copy_atom_B = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    mB.element_type,
+                    num_bits_per_copy=128,
+                )
+                copy_thread_layout = cute.make_layout(
+                    (32, 8), stride=(1, 32)
+                )
+                copy_value_layout = cute.make_layout((4, 1))
+                tiled_copy_A = cute.make_tiled_copy_tv(
+                    copy_atom_A,
+                    copy_thread_layout,
+                    copy_value_layout,
+                )
+                tiled_copy_B = cute.make_tiled_copy_tv(
+                    copy_atom_B,
+                    copy_thread_layout,
+                    copy_value_layout,
+                )
+
+                mma_op = cute.nvgpu.MmaUniversalOp(
+                    cutlass.Float32
+                )
+                mma_atom_layout = cute.make_layout(
+                    (16, 16, 1), stride=(1, 16, 0)
+                )
+                tiled_mma = cute.make_tiled_mma(
+                    mma_op, mma_atom_layout
+                )
+
+                tiled_mma_sgemm_kernel(
+                    mA,
+                    mB,
+                    mC,
+                    sA_layout,
+                    sB_layout,
+                    tiled_copy_A,
+                    tiled_copy_B,
+                    tiled_mma,
+                ).launch(
+                    grid=[
+                        cute.ceil_div(mC.shape[0], 128),
+                        cute.ceil_div(mC.shape[1], 128),
+                        1,
+                    ],
+                    block=[cute.size(mma_atom_layout), 1, 1],
+                )
+
+
+            A_tiled_mma = A.float().T.contiguous().T
+            B_tiled_mma = B.float().T
+            C_tiled_mma = (
+                torch.empty(
+                    (K, M), device="cuda", dtype=torch.float32
+                )
+                .zero_()
+                .permute(1, 0)
+            )
+
+            A_tiled_mma_cute = from_dlpack(
+                A_tiled_mma, assumed_align=16
+            )
+            B_tiled_mma_cute = from_dlpack(
+                B_tiled_mma, assumed_align=16
+            )
+            C_tiled_mma_cute = from_dlpack(
+                C_tiled_mma, assumed_align=16
+            )
+            compiled_tiled_mma = cute.compile(
+                solve_tiled_mma,
+                A_tiled_mma_cute,
+                B_tiled_mma_cute,
+                C_tiled_mma_cute,
+            )
+
+
+            def launch_tiled_mma():
+                compiled_tiled_mma(
+                    A_tiled_mma_cute,
+                    B_tiled_mma_cute,
+                    C_tiled_mma_cute,
+                )
+
+
+            launch_tiled_mma()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                C_tiled_mma, reference, rtol=1e-4, atol=1e-3
+            )
+            tiled_mma_ms, tiled_mma_tflops = measure_tflops(
+                launch_tiled_mma, M, N, K
+            )
+            print(
+                f"TiledMma: {tiled_mma_ms:.4f} ms, "
+                f"{tiled_mma_tflops:.2f} TFLOP/s"
+            )
+            """
+        ),
+    ]
+
+
 def day10_cells() -> list[dict[str, object]]:
-    scaffold = puzzle_body("day10_gemm_tour", "class SimpleSGemm")
     return [
         markdown(
             """
@@ -768,7 +1618,12 @@ def day10_cells() -> list[dict[str, object]]:
             builds a Blackwell speed-of-light GEMM with TMA, UMMA, tensor
             memory, software pipelining, and a vectorized epilogue. This
             notebook teaches the same algorithmic roles with an
-            H100-compatible, single-stage FP32 SIMT GEMM.
+            H100-compatible, single-stage SIMT progression using FP16 inputs
+            and FP32 accumulation, then develops a tensor-core roadmap for:
+
+            - H100/SM90: TMA plus warpgroup MMA (WGMMA);
+            - B300/SM103: TMA plus `tcgen05.mma`, tensor memory, and a
+              subtiled FP16 epilogue.
 
             The objective is to connect the earlier lessons:
 
@@ -777,8 +1632,9 @@ def day10_cells() -> list[dict[str, object]]:
                     -> per-thread MMA fragments -> K reduction -> epilogue
             ```
 
-            The local kernel favors visibility over peak throughput. The final
-            sections map each stage to the more specialized Blackwell version.
+            The local challenge favors visibility over peak throughput. The
+            final sections preserve that dataflow while replacing one mechanism
+            at a time with the architecture-specific fast path.
             """
         ),
         code(
@@ -801,15 +1657,15 @@ def day10_cells() -> list[dict[str, object]]:
             This lesson computes:
 
             \[
-            C_{m,n} = \sum_{k=0}^{K-1} A_{m,k} B_{n,k}.
+            C_{m,k} = \sum_{n=0}^{N-1} A_{m,n} B_{n,k}.
             \]
 
-            Therefore A has logical shape `(M, K)`, B has logical shape
-            `(N, K)`, and C has shape `(M, N)`. B is represented as `(N, K)`
-            so the expression is `A @ B.T`.
+            Therefore A has logical shape `(M, N)`, B has logical shape
+            `(N, K)`, and C has shape `(M, K)`, matching the usual
+            `torch.mm(A, B)` convention.
 
-            Each output element performs K multiplies and K accumulations,
-            conventionally counted as `2*K` floating-point operations. Total
+            Each output element performs N multiplies and N accumulations,
+            conventionally counted as `2*N` floating-point operations. Total
             work is:
 
             ```text
@@ -821,7 +1677,7 @@ def day10_cells() -> list[dict[str, object]]:
             """
             def gemm_work(m, n, k, element_bytes=4):
                 flops = 2 * m * n * k
-                minimum_bytes = (m * k + n * k + m * n) * element_bytes
+                minimum_bytes = (m * n + n * k + m * k) * element_bytes
                 return flops, minimum_bytes, flops / minimum_bytes
 
 
@@ -834,126 +1690,19 @@ def day10_cells() -> list[dict[str, object]]:
                 )
             """
         ),
+        *day10_optimization_cells(),
         markdown(
             """
-            ## 2. The blocked-GEMM hierarchy
+            ## 6. From thread-layout tiling to MMA ownership
 
-            ![Blocked GEMM](../notebooks/images/blocked_gemm.svg)
+            Optimization 2 uses the same partitioning idea as the CuTe C++
+            tutorial: copy layouts own global/shared movement, while a compute
+            layout owns shared/register movement and C. The 8x8 accumulator
+            shape is derived from `tCgC.shape`, not duplicated in the
+            allocation.
 
-            One CTA owns a `(BLK_M, BLK_N)` output tile and traverses K in
-            `BLK_K` chunks:
-
-            ```text
-            grid tile (block_m, block_n)
-                -> A tile: BLK_M x BLK_K
-                -> B tile: BLK_N x BLK_K
-                -> C tile: BLK_M x BLK_N
-                -> repeat across K tiles
-            ```
-
-            This lesson uses `(64, 64, 8)`. M and N must be multiples of 64 and
-            K must be a multiple of 8 because the challenge intentionally omits
-            edge predication. Day 04 showed how an identity coordinate tensor
-            would be used to remove that restriction.
-            """
-        ),
-        markdown(
-            """
-            ## 3. Why the host tensors look transposed
-
-            PyTorch allocates row-major tensors, but this kernel wants stride 1
-            in the M mode for A/C and the N mode for B. It creates row-major
-            `(K, M)` storage and then permutes the view:
-
-            ```python
-            a = torch.empty(K, M).permute(1, 0)  # logical (M,K), stride (1,M)
-            b = torch.empty(K, N).permute(1, 0)  # logical (N,K), stride (1,N)
-            c = torch.empty(N, M).permute(1, 0)  # logical (M,N), stride (1,M)
-            ```
-
-            `permute` changes the view, not the stored values. Contiguous major
-            modes make each thread's four-Float32, 128-bit copy contiguous.
-            """
-        ),
-        code(
-            """
-            M, N, K = 256, 256, 64
-            a_host = torch.empty(K, M).permute(1, 0)
-            b_host = torch.empty(K, N).permute(1, 0)
-            c_host = torch.empty(N, M).permute(1, 0)
-
-            print("A shape/stride:", a_host.shape, a_host.stride())
-            print("B shape/stride:", b_host.shape, b_host.stride())
-            print("C shape/stride:", c_host.shape, c_host.stride())
-            assert a_host.stride()[0] == 1
-            assert b_host.stride()[0] == 1
-            assert c_host.stride()[0] == 1
-            """
-        ),
-        markdown(
-            """
-            ## 4. `local_tile` selects one CTA's views
-
-            A conceptual `(M,N,K)` CTA tiler must be projected onto tensors that
-            do not contain all three modes:
-
-            | Tensor | Logical modes | Projection | Result |
-            | --- | --- | --- | --- |
-            | A | `(M,K)` | `(1,None,1)` | `(BLK_M,BLK_K,k_tiles)` |
-            | B | `(N,K)` | `(None,1,1)` | `(BLK_N,BLK_K,k_tiles)` |
-            | C | `(M,N)` | `(1,1,None)` | `(BLK_M,BLK_N)` |
-
-            With `coord=(bidx,bidy,None)`, the CTA fixes its M/N grid location
-            while preserving the complete K-tile mode. The trailing K-tile
-            mode is the mainloop iteration space.
-            """
-        ),
-        code(
-            """
-            def tile_counts(m, n, k, tile=(64, 64, 8)):
-                return tuple(dim // block for dim, block in zip((m, n, k), tile))
-
-
-            counts = tile_counts(256, 256, 64)
-            assert counts == (4, 4, 8)
-            print(
-                f"grid={counts[0]} x {counts[1]} CTAs; "
-                f"each CTA performs {counts[2]} K-tile iterations"
-            )
-            """
-        ),
-        markdown(
-            """
-            ## 5. Global-to-shared movement
-
-            A and B tiles are cooperatively copied into shared memory. A
-            `CopyAtom` describes one hardware copy operation; `TiledCopy`
-            distributes those operations across `(thread,value)` coordinates.
-
-            This kernel uses:
-
-            ```python
-            cute.nvgpu.cpasync.CopyG2SOp()
-            num_bits_per_copy = 4 * 32  # four Float32 values = 128 bits
-            ```
-
-            `thr_copy.partition_S(gA)` and `partition_D(sA)` create aligned
-            per-thread source and destination views. The views describe
-            ownership; `cute.copy` performs the transfer.
-
-            After issuing copies:
-
-            1. `cp_async_commit_group()` closes the copy group.
-            2. `cp_async_wait_group(0)` waits until no group remains pending.
-            3. `barrier()` makes the shared tile safe for all consumer threads.
-            """
-        ),
-        markdown(
-            """
-            ## 6. Shared-to-register movement and MMA ownership
-
-            `TiledMma` describes how MMA work is distributed. Each thread first
-            obtains a slice:
+            CuTe's next abstraction, `TiledMma`, packages that ownership around
+            a selected matrix instruction. Each thread first obtains a slice:
 
             ```python
             thr_mma = tiled_mma.get_slice(tidx)
@@ -966,52 +1715,52 @@ def day10_cells() -> list[dict[str, object]]:
             - `partition_C(gC)` maps accumulator ownership to output addresses;
             - `make_fragment_A/B/C` allocates matching register fragments.
 
-            Partitioned tensors are mappings, not copies. Data enters the A/B
-            register fragments only when `autovec_copy` executes. The C
-            fragment must be initialized to zero before the K reduction.
+            Partitioned tensors are mappings, not copies. Data enters A/B
+            register fragments only when a copy executes. The accumulator
+            fragment must be initialized to zero before the reduction.
             """
         ),
         markdown(
             """
-            ## 7. The single-stage K mainloop
+            ## 7. The single-stage reduction mainloop
 
-            For every K tile:
+            The standalone kernel reduces over N tiles:
 
             ```text
-            global A/B --cp.async--> shared A/B
-                    wait + CTA barrier
-            shared A/B --autovec_copy--> register A/B
-            register A/B --cute.gemm--> register accumulator
+            global A/B --cooperative loads--> shared A/B
+                    CTA barrier
+            shared A/B --scalar reads--> register values
+            register values --SIMT FMA--> 8x8 register accumulator
                     CTA barrier before shared-memory overwrite
             ```
 
-            This ordering is intentionally conservative. The wait prevents
-            compute from reading incomplete data; the final barrier prevents
+            This ordering is intentionally conservative. The first barrier
+            prevents compute from reading incomplete data; the second prevents
             the next iteration from overwriting shared memory while another
-            thread still consumes it.
-
-            The inner `k_block` loop is compile-time unrolled because fragment
-            shapes are static. The outer `k_tile` loop depends on the problem's
-            dynamic K extent.
+            thread still consumes it. TMA and asynchronous pipelines later
+            overlap these phases without changing the dependency.
             """
         ),
         code(
             """
-            BLK_M, BLK_N, BLK_K = 64, 64, 8
-            outputs_per_cta = BLK_M * BLK_N
-            fmas_per_k_tile = BLK_M * BLK_N * BLK_K
+            BLK_M, REDUCTION_TILE, BLK_K = 128, 8, 128
+            outputs_per_cta = BLK_M * BLK_K
+            fmas_per_reduction_tile = (
+                BLK_M * BLK_K * REDUCTION_TILE
+            )
             print(f"outputs per CTA: {outputs_per_cta}")
-            print(f"FMAs per K tile: {fmas_per_k_tile}")
-            print(f"FLOPs per K tile: {2 * fmas_per_k_tile}")
+            print(f"FMAs per N tile: {fmas_per_reduction_tile}")
+            print(f"FLOPs per N tile: {2 * fmas_per_reduction_tile}")
             """
         ),
         markdown(
             """
             ## 8. Epilogue: accumulator to global C
 
-            After all K tiles, `tCrC` contains the complete per-thread
-            accumulator. The simple epilogue copies it directly to the matching
-            `tCgC` global view.
+            After all N tiles, each thread's 8x8 register tensor contains its
+            complete outputs. The simple epilogue copies the flattened
+            accumulator into the matching `tCgC` partition and stores FP32
+            values directly to C.
 
             Production epilogues often add:
 
@@ -1027,115 +1776,459 @@ def day10_cells() -> list[dict[str, object]]:
         ),
         markdown(
             """
-            ## 9. H100 lesson versus Blackwell SOL GEMM
+            ## 9. Implementation ladder for the same GEMM
 
-            | Algorithmic role | This notebook | Official Notebook 12 |
-            | --- | --- | --- |
-            | Global-to-shared load | Cooperative `cp.async` | TMA |
-            | Matrix operation | FP32 `MmaUniversalOp` | tcgen05/UMMA |
-            | Accumulator storage | Registers | Tensor memory |
-            | A/B synchronization | CTA barriers | TMA-UMMA pipelines |
-            | Staging | One stage | Multiple prefetched stages |
-            | Epilogue | Direct register-to-global copy | Subtiled/vectorized |
+            | Role | Layout-tiled SIMT | TiledCopy/TiledMma bridge | H100 / SM90 | B300 / SM103 |
+            | --- | --- | --- | --- | --- |
+            | A/B datatype | FP16 | FP32 | FP16 | FP16 |
+            | Accumulator | FP32 registers | FP32 registers | FP32 registers | FP32 tensor memory |
+            | Global-to-shared | copy thread layout | `TiledCopy` | TMA | TMA |
+            | Matrix operation | scalar/SIMT FMA | `MmaUniversalOp` | warpgroup MMA | `tcgen05.mma` |
+            | Synchronization | CTA barriers | CTA barriers | `PipelineTmaAsync` | `PipelineTmaUmma` |
+            | Scheduling unit | copy/compute layouts | `TiledCopy`/`TiledMma` slices | 128-thread warpgroup | one- or two-CTA MMA group |
+            | Epilogue | direct FP32 register store | universal FP32 store | vectorized register/shared store | TMEM -> registers -> FP16 vector/TMA store |
 
-            The Blackwell notebook is SM100-only. Do not try to execute its
-            TMA/UMMA/tensor-memory kernel on H100. The local challenge preserves
-            the decomposition while using mechanisms supported by the current
-            pod.
+            H100 has compute capability 9.0 and can execute the baseline plus
+            the SM90 path. B300 is compute capability 10.3 and needs an SM103
+            toolchain. The pinned CUTLASS release documents CUDA 13.0 as the
+            minimum for B300 and CuTe DSL GB300 support with CUDA Toolkit 13.1.
+            The current H100 pod cannot execute or validate SM103 code.
+
+            WGMMA is not the compatibility path for B300. The checked-in CuTe
+            headers guard it behind `CUTE_ARCH_MMA_SM90A_ENABLED`, while
+            SM100/SM103 enable the `tcgen05` and TMEM feature families. Keep a
+            shared host interface if useful, but compile separate SM90 WGMMA
+            and SM103 `tcgen05.mma` kernels.
+
+            Official Notebook 12 is an SM100 implementation. Its `tcgen05`,
+            TMEM, and pipeline concepts transfer to SM103, but instruction
+            selection, target flags such as `sm_103a`, tile choices, and
+            performance must be revalidated on B300.
+            """
+        ),
+        *day10_tiled_mma_cells(),
+        markdown(
+            """
+            ## 11. Connect the complete standalone dataflow
+
+            Optimization 2 exposes every ownership mapping directly. Read it
+            from the output coordinate backward:
+
+            1. `compute_thread_layout` partitions the 128x128 C tile.
+            2. Projecting it onto one mode partitions shared A and B.
+            3. The resulting C partition defines an 8x8 register accumulator.
+            4. `copy_thread_layout` partitions matching global/shared tiles.
+            5. Two CTA barriers protect each shared-memory stage.
+
+            This keeps the implementation in the same standalone
+            `@cute.kernel` plus `@cute.jit` style as the baseline and
+            Optimization 1, instead of switching to the later class-based
+            `SimpleSGemm` scaffold. Optimization 3 preserves that dataflow but
+            packages the copy and compute ownership in `TiledCopy` and
+            `TiledMma`.
             """
         ),
         markdown(
             """
-            ## 10. Challenge: connect the complete dataflow
+            ## 12. Define the FP16 contract before tensor-core optimization
 
-            Fill three connected regions:
-
-            1. **CTA tiles:** use `local_tile` with the correct projections.
-            2. **Ownership:** allocate shared tensors, partition copies/MMA, and
-               allocate register fragments.
-            3. **Mainloop and epilogue:** move each K tile through memory spaces,
-               accumulate it, and store C.
-
-            Track every variable by writing a sentence of the form:
+            Use FP16 for A, B, and the final output, but accumulate in FP32:
 
             ```text
-            tAgA maps this thread's copy coordinates
-            to addresses in the CTA's global A tile.
+            A: FP16
+            B: FP16
+            accumulator: FP32
+            C/D: FP16 after epilogue conversion
             ```
 
-            If you cannot state both the domain and destination, inspect that
-            tensor before continuing.
-            """
-        ),
-        code(scaffold),
-        markdown(
-            """
-            ## 11. Correctness before performance
-
-            Complete all TODO regions, then run a small problem. The PyTorch
-            reference uses the same `(M,K) x (N,K)` convention:
+            The first three teaching kernels use FP16 A/B with FP32
+            accumulation and output. The `TiledMma` bridge deliberately uses
+            FP32 operands because `MmaUniversalOp(Float32)` creates FP32
+            fragments. The tensor-core contract returns to FP16 A/B, changes
+            the epilogue output to FP16, and retains FP32 accumulation.
+            Converting to FP16 should happen once, after the complete
+            reduction. A correctness reference should accumulate in FP32:
 
             ```python
-            torch.einsum("mk,nk->mn", a, b)
+            reference = (A.float() @ B.float()).half()
+            torch.testing.assert_close(
+                output, reference, atol=2e-2, rtol=2e-2
+            )
             ```
+
+            The tolerance must be chosen for the tested K range and data
+            distribution rather than copied blindly. Also test NaN/Inf behavior,
+            odd edge tiles, and inputs with very different magnitudes.
             """
         ),
         code(
             """
-            run(M=256, N=256, K=64)
+            def staged_ab_smem_bytes(tile_mnk, stages, element_bytes=2):
+                block_m, block_n, block_k = tile_mnk
+                one_stage = (block_m * block_k + block_n * block_k) * element_bytes
+                return one_stage, one_stage * stages
+
+
+            candidates = [
+                ("H100", (128, 128, 64), 3),
+                ("B300", (128, 256, 64), 3),
+            ]
+            for name, tile, stages in candidates:
+                one, total = staged_ab_smem_bytes(tile, stages)
+                print(
+                    f"{name}: tile={tile}, one A/B stage={one / 1024:.1f} KiB, "
+                    f"{stages} stages={total / 1024:.1f} KiB"
+                )
             """
         ),
         markdown(
             """
-            ## 12. Benchmark and compute throughput
+            ## 13. H100 path: FP16 TMA plus WGMMA
 
-            Use CUDA events after warmup. If average duration is in
-            milliseconds:
+            The first H100 transformation is not merely replacing the copy
+            instruction. TMA changes ownership and synchronization:
 
-            ```text
-            GFLOP/s = (2*M*N*K) / (average_ms / 1000) / 1e9
-            TFLOP/s = GFLOP/s / 1000
+            1. A host-side descriptor encodes the global tensor and shared tile.
+            2. One elected thread issues a bulk tensor load.
+            3. An mbarrier records the expected transaction byte count.
+            4. A 128-thread warpgroup waits for a full stage and issues WGMMA.
+            5. The consumer releases that stage so TMA can refill it.
+
+            The installed CuTe DSL Hopper helper constructs an FP16 WGMMA with
+            FP32 accumulation:
+
+            ```python
+            import cutlass.pipeline as pipeline
+            import cutlass.utils.hopper_helpers as sm90_utils
+
+            tiled_mma = sm90_utils.make_trivial_tiled_mma(
+                cutlass.Float16,                 # A
+                cutlass.Float16,                 # B
+                a_major_mode,
+                b_major_mode,
+                cutlass.Float32,                 # accumulator
+                atom_layout_mnk=(1, 1, 1),
+                tiler_mn=(64, 128),
+            )
             ```
 
-            This SIMT teaching kernel is not expected to approach H100 tensor
-            core peak. Its value is a transparent baseline whose movement,
-            synchronization, and ownership can be inspected.
-            """
-        ),
-        code(
-            """
-            # The reference script includes warmup, CUDA-event timing, and TFLOP/s.
-            # Run it after your notebook implementation is correct.
-            %run solution.py --M 1024 --N 1024 --K 256 --warmup 5 --iterations 50
+            `a_major_mode` and `b_major_mode` must match the shared-memory
+            layouts consumed by WGMMA. A convenient starting CTA tile is
+            `(128, 128, 64)` with three A/B stages, but it is a benchmark
+            candidate rather than a universal optimum.
             """
         ),
         markdown(
             """
-            ## 13. Optimization path
+            ### 13.1 Build TMA descriptors and a staged pipeline
 
-            The official tour applies two major transformations after its first
-            correct GEMM:
+            A simplified host-side descriptor pattern is:
 
-            1. **Software pipeline A/B:** prefetch future K tiles so memory
-               latency overlaps current MMA. The stage count and protocol come
-               from Day 07.
-            2. **Vectorize the epilogue:** expose alignment and divisibility so
-               CuTe can issue wide global stores.
+            ```python
+            op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+            a_tma_atom, a_tma_tensor = (
+                cute.nvgpu.cpasync.make_tiled_tma_atom(
+                    op, a, a_smem_layout_one_stage, (block_m, block_k)
+                )
+            )
+            b_tma_atom, b_tma_tensor = (
+                cute.nvgpu.cpasync.make_tiled_tma_atom(
+                    op, b, b_smem_layout_one_stage, (block_n, block_k)
+                )
+            )
+            ```
+
+            In the kernel, `PipelineTmaAsync` replaces the unconditional
+            `cp_async_wait_group(0)`:
+
+            ```python
+            mainloop_pipeline = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mainloop_pipeline_array_ptr.data_ptr(),
+                num_stages=ab_stages,
+                producer_group=producer_group,
+                consumer_group=consumer_group,
+                tx_count=tma_copy_bytes,
+                cta_layout_vmnk=cta_layout_vmnk,
+            )
+            ```
+
+            The producer acquires an empty stage, issues A/B TMA loads, and
+            commits it. The WGMMA consumer waits for that stage, accumulates,
+            and releases it. Prologue and tail handling are required so the
+            ring never reads an unfilled slot or overwrites an in-use slot.
 
             ![Software pipeline](../notebooks/images/software_pipelining_ab_stages_minus_2.svg)
+            """
+        ),
+        code(
+            """
+            def pipeline_schedule(k_tiles, stages=3):
+                if stages < 2:
+                    raise ValueError("overlap needs at least two stages")
+                prefetch_distance = stages - 1
+                events = []
+                for step in range(k_tiles + prefetch_distance):
+                    load = step if step < k_tiles else None
+                    compute_idx = step - prefetch_distance
+                    compute = compute_idx if 0 <= compute_idx < k_tiles else None
+                    events.append((step, load, compute))
+                return events
 
-            A practical progression for this H100 baseline is:
+
+            for step, load, compute in pipeline_schedule(k_tiles=6, stages=3):
+                print(
+                    f"step {step}: "
+                    f"TMA load={load if load is not None else '-'}; "
+                    f"WGMMA compute={compute if compute is not None else '-'}"
+                )
+            """
+        ),
+        markdown(
+            """
+            ### 13.2 H100 optimization order
+
+            Apply and measure these independently:
+
+            1. FP16 inputs with FP32 accumulation.
+            2. WGMMA while retaining a simple copy path.
+            3. TMA descriptors and swizzled staged shared layouts.
+            4. Two- then three-stage producer/consumer overlap.
+            5. Warp specialization and persistent tile scheduling.
+            6. FP32-to-FP16 conversion plus vectorized or TMA output stores.
+            7. Cluster multicast only when neighboring CTAs reuse A or B.
+
+            The complete tracked C++ reference is
+            [`24_cute_hopper_wgmma_tma.cu`](../../cuda-cpp/solutions/24_cute_hopper_wgmma_tma.cu).
+            It uses a `(128,128,64)` tile, three stages, FP16 TMA loads, and
+            WGMMA. The production-style CuTe DSL implementation in the pinned
+            CUTLASS source is `examples/python/CuTeDSL/cute/hopper/kernel/`
+            `dense_gemm/dense_gemm.py`.
+            """
+        ),
+        markdown(
+            """
+            ## 14. B300 path: SM103 `tcgen05.mma` and tensor memory
+
+            Blackwell changes the accumulator dataflow. `tcgen05.mma` consumes
+            A/B from shared memory but places the FP32 accumulator in tensor
+            memory (TMEM), not ordinary per-thread registers:
 
             ```text
-            add edge predication
-              -> add two or three A/B stages
-              -> overlap copy and compute
-              -> vectorize output
-              -> replace SIMT MMA with an H100 tensor-core atom
+            FP16 A/B in GMEM
+                 -> TMA -> staged, swizzled SMEM
+                 -> tcgen05.mma
+                 -> FP32 accumulator in TMEM
+                 -> tcgen05.ld -> per-thread registers
+                 -> FP16 conversion/fusion
+                 -> vectorized or TMA store
             ```
 
-            Make one transformation at a time, preserve the correctness check,
-            and use Day 08's benchmark discipline to evaluate it.
+            The official CuTe DSL construction used by Notebook 12 is:
+
+            ```python
+            from cutlass.cute.nvgpu import tcgen05
+
+            op = tcgen05.MmaF16BF16Op(
+                cutlass.Float16,
+                cutlass.Float32,
+                (128, 256, 16),
+                tcgen05.CtaGroup.ONE,
+                tcgen05.OperandSource.SMEM,
+                tcgen05.OperandMajorMode.K,
+                tcgen05.OperandMajorMode.K,
+            )
+            tiled_mma = cute.make_tiled_mma(op)
+            ```
+
+            FP16 `tcgen05.mma` has native K depth 16 in this configuration.
+            A practical K tile groups several instructions, for example
+            `4 * 16 = 64`.
+            """
+        ),
+        markdown(
+            """
+            ### 14.1 TMA/UMMA pipeline and TMEM lifetime
+
+            Blackwell's mainloop uses two protocols:
+
+            - `PipelineTmaUmma`: TMA produces full A/B stages and UMMA releases
+              consumed stages;
+            - `PipelineUmmaAsync`: the MMA producer signals when the TMEM
+              accumulator is ready for the epilogue.
+
+            The kernel must explicitly manage TMEM:
+
+            ```python
+            tmem = cutlass.utils.TmemAllocator(
+                storage.tmem_holding_buf.ptr,
+                barrier_for_retrieve=tmem_alloc_barrier,
+            )
+            tmem.allocate(num_tmem_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            ...
+            tmem.relinquish_alloc_permit()
+            ...
+            tmem.free(tmem_ptr)
+            ```
+
+            Only an elected warp needs to issue TMA and `tcgen05.mma`, but all
+            participating threads must obey the allocation, pipeline, and
+            epilogue barriers. A missing release or TMEM lifetime transition can
+            deadlock even when the tensor layouts are correct.
+            """
+        ),
+        markdown(
+            """
+            ### 14.2 Subtile the FP16 epilogue
+
+            A `(128,256)` FP32 accumulator is too large to copy from TMEM into
+            registers in one piece without severe register pressure. Partition
+            it into epilogue subtiles:
+
+            ```python
+            tmem_atom = cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),
+                cutlass.Float32,
+            )
+            tmem_copy = tcgen05.make_tmem_copy(
+                tmem_atom, accumulator_subtile
+            )
+
+            for subtile in range(subtile_count):
+                cute.copy(tmem_copy, tmem_source[subtile], rmem_acc)
+                rmem_fp16.store(rmem_acc.load().to(cutlass.Float16))
+                cute.autovec_copy(rmem_fp16, global_output[subtile])
+            ```
+
+            Subtiling reduces live registers and permits overlap between
+            `tcgen05.ld`, conversion/fusion, and stores. The next steps are a
+            TMA epilogue, one-to-two CTA-group experiments, and multicast when
+            the cluster shape creates real operand reuse.
+            """
+        ),
+        markdown(
+            """
+            ### 14.3 B300 execution gate
+
+            Do not run the SM100 notebook binary on the H100 pod and do not
+            assume SM100 launch parameters are optimal for B300. For B300:
+
+            - compile for the SM103 architecture family, commonly `sm_103a`
+              when architecture-specific features are used;
+            - use CUDA 13.0 or newer, with CUDA Toolkit 13.1 for the pinned
+              release's CuTe DSL GB300 support;
+            - rebuild descriptors and kernels on the B300 host;
+            - rerun correctness, stage-count, tile, CTA-group, and cluster
+              searches on that hardware.
+
+            Follow the tracked references in order:
+
+            1. [`25_cute_blackwell_mma.cu`](../../cuda-cpp/solutions/25_cute_blackwell_mma.cu):
+               `tcgen05.mma` plus TMEM.
+            2. [`26_cute_blackwell_mma_tma.cu`](../../cuda-cpp/solutions/26_cute_blackwell_mma_tma.cu):
+               add TMA.
+            3. [`27_cute_blackwell_mma_tma_2sm.cu`](../../cuda-cpp/solutions/27_cute_blackwell_mma_tma_2sm.cu):
+               two-SM MMA and multicast.
+            4. [`28_cute_blackwell_mma_tma_epilogue.cu`](../../cuda-cpp/solutions/28_cute_blackwell_mma_tma_epilogue.cu):
+               optimized TMA epilogue.
+            """
+        ),
+        markdown(
+            """
+            ## 15. Measurement ladder
+
+            Keep one correctness oracle and record a row after every isolated
+            transformation:
+
+            | Version | Required observation |
+            | --- | --- |
+            | FP16 SIMT + FP32 output | Correct mapping and synchronization |
+            | FP16 epilogue + FP32 accumulate | Error remains within the declared contract |
+            | Tensor-core MMA | Tensor-core instructions appear in profiling |
+            | TMA | Lower load-instruction pressure; descriptor path is active |
+            | Multistage pipeline | Fewer long scoreboard / memory dependency stalls |
+            | Persistent schedule | Better steady-state utilization on large grids |
+            | Optimized epilogue | Lower store time and controlled register pressure |
+
+            Report TFLOP/s, achieved bandwidth, occupancy, registers/thread,
+            dynamic shared memory, and the dominant stall reason. A faster
+            kernel with incorrect edge behavior or unexplained numerical drift
+            does not advance to the next stage.
+            """
+        ),
+        markdown(
+            """
+            ## 16. Register and compare the tensor-core result
+
+            Package the architecture-specific implementation in
+            `optimized_case`. The H100 version should use WGMMA; the B300
+            version should use `tcgen05.mma`. Both should use FP16 A/B/output
+            with FP32 accumulation and the same benchmark dimensions as the
+            baseline.
+
+            ```python
+            optimized_case = {
+                "name": "B300 FP16 TMA + tcgen05",
+                "launch": launch_b300_tcgen05,
+                "output": b300_output,
+                "reference": b300_reference,
+                "atol": 2e-2,
+                "rtol": 2e-2,
+            }
+            ```
+
+            Once registered, the existing `measure_tflops` helper compares it
+            against the CuTe layout-tiled teaching kernel. No second benchmark
+            framework is needed.
+            """
+        ),
+        code(
+            """
+            device_capability = torch.cuda.get_device_capability()
+            if device_capability == (9, 0):
+                expected_path = "H100/SM90: register FP16 TMA + WGMMA"
+            elif device_capability >= (10, 3):
+                expected_path = "B300/SM103: register FP16 TMA + tcgen05"
+            else:
+                expected_path = (
+                    f"unsupported optimization target {device_capability}; "
+                    "the SIMT teaching kernels may still run"
+                )
+            print(expected_path)
+
+            if "optimized_case" not in globals():
+                print(
+                    "Define optimized_case after implementing the architecture-"
+                    "specific kernel, then rerun this cell."
+                )
+            else:
+                optimized_case["output"].zero_()
+                optimized_case["launch"]()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    optimized_case["output"],
+                    optimized_case["reference"],
+                    atol=optimized_case["atol"],
+                    rtol=optimized_case["rtol"],
+                )
+                optimized_ms, optimized_tflops = measure_tflops(
+                    optimized_case["launch"],
+                    M,
+                    N,
+                    K,
+                    warmup=10,
+                    iterations=50,
+                )
+                print(
+                    f"CuTe layout-tiled SIMT: {warp_tiled_ms:.4f} ms, "
+                    f"{warp_tiled_tflops:.2f} TFLOP/s"
+                )
+                print(
+                    f"{optimized_case['name']}: {optimized_ms:.4f} ms, "
+                    f"{optimized_tflops:.2f} TFLOP/s, "
+                    f"{optimized_tflops / warp_tiled_tflops:.2f}x"
+                )
             """
         ),
         markdown(
@@ -1148,9 +2241,12 @@ def day10_cells() -> list[dict[str, object]]:
             - Shared memory enables reuse but requires correct producer/consumer ordering.
             - Register fragments hold per-thread operands and accumulators.
             - A correct single-stage kernel exposes where pipelining can overlap work.
-            - Hardware-specific SOL kernels preserve these roles while replacing
-              mechanisms with TMA, tensor cores, specialized pipelines, and
-              vectorized epilogues.
+            - H100 replaces cooperative copies and SIMT FMA with TMA, WGMMA,
+              staged mbarrier pipelines, and an optimized FP16 epilogue.
+            - B300 moves FP32 accumulators into TMEM and coordinates TMA with
+              `tcgen05.mma` through architecture-specific pipelines.
+            - SM100 teaching code is a conceptual bridge to SM103, not a
+              substitute for compiling and tuning on B300.
             """
         ),
     ]

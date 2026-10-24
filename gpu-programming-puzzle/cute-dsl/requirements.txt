@@ -1,4 +1,4 @@
-# Dependencies for the CuTe DSL puzzles (Days 01-11).
+# Dependencies for the CuTe DSL puzzles (Days 01-12).
 #
 # Install with:
 #   python -m venv .venv && source .venv/bin/activate

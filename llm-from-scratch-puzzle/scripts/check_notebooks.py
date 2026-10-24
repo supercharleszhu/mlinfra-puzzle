@@ -8,40 +8,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
-    "chapter02_text_data/chapter02.ipynb": {
-        "LLM_TODO_CH02_01_BYTES",
-        "LLM_TODO_CH02_02_WINDOWS",
+    "chapter01_cs336_transformer_e2e/chapter01.ipynb": set(),
+    "chapter02_classification/chapter02.ipynb": {
+        "LLM_TODO_CH02_01_PADDING",
+        "LLM_TODO_CH02_02_UNFREEZE",
+        "LLM_TODO_CH02_03_REPRESENTATION",
     },
-    "chapter03_attention/chapter03.ipynb": {
-        "ATTENTION_TODO_CH03_00_CAUSAL",
-        "ATTENTION_TODO_CH03_00_MULTIHEAD",
-        "ATTENTION_TODO_CH03_00_SIMPLE",
-        "LLM_TODO_CH03_01_TRANSFER",
-        "LLM_TODO_CH03_02_MULTIHEAD",
-        "LLM_TODO_CH03_03_DIMENSIONS",
-    },
-    "chapter04_gpt_architecture/chapter04.ipynb": {
-        "LLM_TODO_CH04_01_COUNTS",
-        "LLM_TODO_CH04_02_ESTIMATE",
-    },
-    "chapter05_pretraining/chapter05.ipynb": {
-        "LLM_TODO_CH05_01_TEMPERATURE",
-        "LLM_TODO_CH05_02_PROFILES",
-        "LLM_TODO_CH05_03_DETERMINISTIC",
-        "LLM_TODO_CH05_04_CHECKPOINT",
-        "LLM_TODO_CH05_05_CROSS_ENTROPY",
-        "LLM_TODO_CH05_06_CONFIG",
-    },
-    "chapter06_classification/chapter06.ipynb": {
-        "LLM_TODO_CH06_01_PADDING",
-        "LLM_TODO_CH06_02_UNFREEZE",
-        "LLM_TODO_CH06_03_REPRESENTATION",
-    },
-    "chapter07_instruction_finetuning/chapter07.ipynb": {
-        "LLM_TODO_CH07_01_FORMAT",
-        "LLM_TODO_CH07_02_MASK",
-        "LLM_TODO_CH07_03_PLAN",
-        "LLM_TODO_CH07_04_LORA",
+    "chapter03_instruction_finetuning/chapter03.ipynb": {
+        "LLM_TODO_CH03_01_FORMAT",
+        "LLM_TODO_CH03_02_MASK",
+        "LLM_TODO_CH03_03_PLAN",
+        "LLM_TODO_CH03_04_LORA",
     },
 }
 
